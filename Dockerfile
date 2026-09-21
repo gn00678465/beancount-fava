@@ -23,10 +23,11 @@ RUN apt-get update \
 # would let the runtime user install more.
 RUN python -m pip uninstall --yes --root-user-action ignore pip
 COPY --from=builder /opt/venv /opt/venv
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 ENV PATH="/opt/venv/bin:$PATH"
 ENV FAVA_HOST=0.0.0.0
 USER 1000:1000
 WORKDIR /ledger
 EXPOSE 5000
-ENTRYPOINT ["tini", "--"]
+ENTRYPOINT ["tini", "--", "docker-entrypoint.sh"]
 CMD ["fava"]
