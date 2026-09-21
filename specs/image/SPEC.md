@@ -1,7 +1,7 @@
 # SPEC — beancount v3 + fava 單一 image、Docker Hub 發佈、自動更新 (Tier 2)
 
-- `spec_version`: v1
-- `status`: approved
+- `spec_version`: v2
+- `status`: revised-pending-approval
 - `tier`: 2
 - `scope`: image
 - `base_ref`: 4fdf55bffa078446fed8b1415e0d25a995f03428
@@ -16,7 +16,7 @@
 - Python 套件釘選在 `pyproject.toml` 和 `uv.lock`：`beancount==3.2.3`、`fava==1.30.16`、`beanprice==2.1.0`。
 - builder stage 執行 `uv sync --locked --no-dev`，`UV_PROJECT_ENVIRONMENT=/opt/venv`。final stage 用同一個 base image，把 `/opt/venv` 複製到相同路徑，`PATH` 以 `/opt/venv/bin` 開頭。
 - apt 套件：`git`、`tini`，不釘選版本。base image digest 更新時會一起重建。
-- 使用者 `fava`，uid 1000。`/ledger` 由 `fava` 擁有，`WORKDIR /ledger`。`ENV FAVA_HOST=0.0.0.0`，`EXPOSE 5000`，`ENTRYPOINT ["tini","--"]`，`CMD ["fava"]`。
+- 使用者 `fava`，uid 1000，Dockerfile 以數字 `USER 1000:1000` 指定。`/ledger` 由 `fava` 擁有，`WORKDIR /ledger`。`ENV FAVA_HOST=0.0.0.0`，`EXPOSE 5000`，`ENTRYPOINT ["tini","--"]`，`CMD ["fava"]`。
 - 帳本以 volume 掛到 `/ledger`，用 `BEANCOUNT_FILE` 指定絕對路徑。
 - 平台：`linux/amd64`、`linux/arm64`。
 - Docker Hub `gn00678465/beancount-fava` 和 GitHub `gn00678465/beancount-fava`，都是 public。
@@ -53,10 +53,11 @@
 ## Gate layers
 
 - 測試：`uv run pytest`，隨機順序（`pytest-randomly`）。
-- Lint 和 format：`ruff check`、`ruff format --check`、`hadolint/hadolint`、`rhysd/actionlint`。
+- Suite health：以另一個隨機順序再執行一次完整測試。
+- Lint 和 format：`ruff check`、`ruff format --check`（排除 `docs/`，ruff 會改寫 Markdown 內引用的上游程式碼）、`hadolint/hadolint`、`rhysd/actionlint`。
 - 多架構 build：`docker buildx build --platform linux/amd64,linux/arm64`。
-- Secret 掃描：`ghcr.io/gitleaks/gitleaks` 掃描工作目錄和 git 歷史。
-- 相依弱點：`pip-audit` 檢查 `uv export` 的結果。
+- Secret 掃描：`ghcr.io/gitleaks/gitleaks` 的 git 模式。gate 執行時工作目錄是乾淨的，所以它涵蓋所有已追蹤的檔案和完整歷史。不用目錄模式，因為它會掃描 `.venv` 和 `.git`。
+- 相依弱點：`pip-audit` 檢查 `uv export` 的結果，只忽略 `PYSEC-2026-2447`。其他弱點仍會讓 gate 失敗。
 - 手動 mutation：移除 `USER`、移除 `FAVA_HOST`、移除 `tini`、移除 `--no-dev`、把 `--locked` 換成 `--frozen`、移除 `/ledger` 的 chown、移除 `publish.yaml` 的 `concurrency`、把 `major` 加進 Renovate allowlist。`tools/mutate.sh` 逐一套用，記錄每個 mutant 由哪個測試抓到；有任何 mutant 存活就失敗。
 - 宣告略過：static types 和 changed-line coverage。repo 內的 Python 只有測試程式，受測對象是 Dockerfile 和設定檔。
 
@@ -75,6 +76,7 @@
 - `renovate_automerge_allowlist` 檢查的是設定內容。Renovate 的實際行為由 `auto_update_end_to_end` 觀察。
 - `BEANCOUNT_FILE` 指向不存在的檔案時，fava 會正常啟動並顯示錯誤，不會退出。本 spec 不加 entrypoint 包裝。
 - 寫入測試使用 fava 沒有穩定性聲明的 JSON API。fava 升版若改了 `add_entries`，CI 會失敗並擋下 automerge，需要您處理。
+- beanprice 2.1.0 相依的 diskcache 5.6.3 有 CVE-2025-69872（`PYSEC-2026-2447`，預設用 pickle 序列化），2026-09-21 沒有修正版。攻擊者要先能寫入 container 內 uid 1000 的快取目錄，而能寫入的人已經能以該身分執行程式。您決定保留 beanprice 並忽略這一項。公開 image 會被掃描工具標示這個 CVE，直到 diskcache 出修正版；transitive 相依的更新要靠您手動 merge Renovate 的 lock file maintenance PR。
 - fava 寫入帳本不是原子操作。git 在 `/ledger` 還需要 `safe.directory` 和 commit 身分。兩者都由 deploy spec 處理。
 
 ## 需要您手動完成的步驟
@@ -90,7 +92,7 @@
 - Git isolation：branch `feat/image`，base 是 `main` 的 4fdf55b。
 - Commit cadence：spec 核准一個 commit。第一個 RED commit 含測試、fixture、只有 `FROM` 的 `Dockerfile`、dev 相依的 `pyproject.toml` 和 `uv.lock`，讓測試因行為不符而失敗。之後每組 scenario 先 RED 再 GREEN。
 - 核准後我會執行 `gh repo create gn00678465/beancount-fava --public` 並 push `main` 和 `feat/image`。merge 到 `main` 由您決定。
-- Gate files by path：`tools/gate.sh`、`tools/mutate.sh`、`.gitignore`（忽略 `.claude/`、`.gate/`、`.venv/`、`__pycache__/`）。
+- Gate files by path：`tools/gate.sh`、`tools/mutate.sh`、`.gitattributes`（固定 LF；這台機器的 `core.autocrlf=true` 會讓 shell 腳本和 sed mutant 在新的 checkout 失效）、`.dockerignore`（build context 只含 `pyproject.toml` 和 `uv.lock`）、`.gitignore`（忽略 `.claude/`、`.gate/`、`.venv/`、`__pycache__/`）。
 - New dependencies：
   - 執行期：`beancount`、`fava`（需求本體）、`beanprice`（提供 `bean-price`）。
   - apt：`git`；`tini`（轉送 SIGTERM。在 Docker Desktop 29.5.3 實測兩次：沒有 init 時 `docker stop` 的 exit code 是 137，有 tini 時是 143）。
@@ -105,3 +107,4 @@
 
 - 2026-09-21 — exploration round 1：repo 名稱、public、automerge 規則。額外套件一題您同時勾選「不額外安裝」、beanprice、git；本 spec 解讀為加裝 beanprice 和 git，待核准時確認。
 - 2026-09-21 — after-spec squad：併入 `.scratch/image/squad/after-spec.md` 的發現。移除 `tools/image_tags.py` 和 mutmut；`--frozen` 改 `--locked --no-dev`；寫入測試改用 named volume；新增 lock drift、arm64、digest、`/ledger` 權限的 scenario；`platformAutomerge: false`；publish 限定 push 到 `main` 並加 `concurrency`。
+- 2026-09-21 — v2：pip-audit 發現 diskcache 的 `PYSEC-2026-2447`；您選擇「保留 beanprice，忽略這一項」。同時記錄實作中出現、v1 沒列出的項目：`.gitattributes`、`.dockerignore`、數字 `USER`、suite-health layer、gitleaks 只用 git 模式、ruff 排除 `docs/`。scenario 和 Must NOT 沒有變動。
