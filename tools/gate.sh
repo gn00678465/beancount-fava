@@ -109,9 +109,9 @@ mkdir -p "$ARTIFACTS"
 echo "gate: scope=$SCOPE base=$(git rev-parse "$BASE_REF") head=$(git rev-parse HEAD)"
 
 run_layer source-state clean_tree
-run_layer tests uv run pytest -q
+run_layer tests uv run pytest -q -p randomly --randomly-seed=20260921
 run_layer lint-format lint_format
-run_layer suite-health uv run pytest -q
+run_layer suite-health uv run pytest -q -p randomly --randomly-seed=12906202
 run_layer multi-arch-build multi_arch_build
 run_layer secrets secrets_scan
 run_layer supply-chain supply_chain
