@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from playwright.sync_api import Browser, Error, expect, sync_playwright
 
 REPO = Path(__file__).resolve().parent.parent
 FIXTURE_LEDGER = REPO / "tests" / "fixtures" / "ledger"
@@ -100,6 +101,21 @@ def fava_port(image: str, ledger_volume: str) -> Iterator[tuple[str, int]]:
         yield name, port
     finally:
         docker("rm", "-f", name)
+
+
+@pytest.fixture(scope="session")
+def browser() -> Iterator[Browser]:
+    """An installed Chrome or Edge; GitHub's ubuntu runners ship Chrome."""
+    with sync_playwright() as playwright:
+        for channel in ("chrome", "msedge"):
+            try:
+                instance = playwright.chromium.launch(channel=channel)
+            except Error:
+                continue
+            yield instance
+            instance.close()
+            return
+        pytest.fail("the UI test needs an installed Chrome or Edge")
 
 
 def _normalize(name: str) -> str:
@@ -195,6 +211,51 @@ def test_fava_serves_and_writes_the_mounted_ledger(
 
     stored = docker("run", "--rm", "-v", f"{ledger_volume}:/ledger", image, "cat", LEDGER_FILE)
     assert "write-probe" in stored.stdout
+
+
+def test_ui_opens_navigates_and_adds_an_entry(
+    image: str, fava_port: tuple[str, int], ledger_volume: str, browser: Browser
+) -> None:
+    _, port = fava_port
+    page = browser.new_context(locale="en-US").new_page()
+    problems: list[str] = []
+    page.on("pageerror", lambda error: problems.append(f"pageerror: {error}"))
+    page.on(
+        "console",
+        lambda message: (
+            problems.append(f"console: {message.text}") if message.type == "error" else None
+        ),
+    )
+
+    page.goto(f"http://127.0.0.1:{port}/")
+    expect(page.locator("h1")).to_contain_text("Income Statement")
+    expect(page.locator("h1")).to_contain_text("Spec Ledger")
+
+    page.locator("aside").get_by_role("link", name="Balance Sheet").click()
+    expect(page.locator("h1")).to_contain_text("Balance Sheet")
+    page.locator("aside").get_by_role("link", name="Journal").click()
+    expect(page.get_by_text("fixture-purchase")).to_be_visible()
+
+    page.locator("aside").get_by_title("Add Journal Entry").click()
+    dialog = page.get_by_role("dialog")
+    dialog.locator("input[type=date]").fill("2024-03-01")
+    dialog.get_by_placeholder("Payee").fill("UI Shop")
+    dialog.get_by_placeholder("Narration").fill("ui-added-entry")
+    dialog.get_by_placeholder("Account").nth(0).fill("Expenses:Food")
+    dialog.get_by_placeholder("Amount").nth(0).fill("30 TWD")
+    dialog.get_by_placeholder("Account").nth(1).fill("Assets:Cash")
+    dialog.get_by_placeholder("Amount").nth(1).fill("-30 TWD")
+    dialog.get_by_role("button", name="Save").click()
+    expect(dialog).to_be_hidden()
+    expect(page.get_by_text("ui-added-entry")).to_be_visible()
+
+    stored = docker("run", "--rm", "-v", f"{ledger_volume}:/ledger", image, "cat", LEDGER_FILE)
+    assert "ui-added-entry" in stored.stdout
+
+    page.locator("aside").get_by_role("link", name="Editor", exact=True).click()
+    expect(page.locator(".cm-content")).to_contain_text('option "title" "Spec Ledger"')
+
+    assert problems == []
 
 
 def test_missing_ledger_file_fails_at_start(image: str) -> None:
