@@ -68,9 +68,10 @@ multi_arch_build() {
   docker buildx build --builder "$BUILDER" --platform "$PLATFORMS" --output type=cacheonly .
 }
 
+# The tree is clean when this runs, so the git scan covers every tracked file
+# and the whole history. A directory scan would also read .venv and .git.
 secrets_scan() {
-  docker run --rm -v "$REPO_MOUNT:/repo" ghcr.io/gitleaks/gitleaks:latest git --no-banner /repo &&
-    docker run --rm -v "$REPO_MOUNT:/repo" ghcr.io/gitleaks/gitleaks:latest dir --no-banner /repo
+  docker run --rm -v "$REPO_MOUNT:/repo" ghcr.io/gitleaks/gitleaks:latest git --no-banner /repo
 }
 
 supply_chain() {

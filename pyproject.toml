@@ -23,3 +23,5 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+# ruff formats Python code blocks inside Markdown; the research notes quote upstream code verbatim.
+extend-exclude = ["docs"]
