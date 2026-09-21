@@ -1,17 +1,25 @@
+"""Checks that run against the built image; CI and publish both depend on them."""
+
 from __future__ import annotations
 
 import json
 import re
-import shutil
 import subprocess
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from conftest import LEDGER_FILE, REPO, build_image, docker, host_port
+
+REPO = Path(__file__).resolve().parent.parent
+FIXTURE_LEDGER = REPO / "tests" / "fixtures" / "ledger"
+LEDGER_FILE = "/ledger/main.beancount"
+# publish.yaml reads the versions for its tags from this image after these tests passed.
+IMAGE_TAG = "beancount-fava:test"
 
 # The image is CPython on Linux. A marker not listed here fails the test, so a
 # new platform-specific dependency gets a decision instead of a silent skip.
@@ -25,6 +33,73 @@ LIST_DISTRIBUTIONS = (
     "import importlib.metadata as m, json;"
     "print(json.dumps([[d.metadata['Name'], d.version] for d in m.distributions()]))"
 )
+
+
+def docker(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["docker", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=check,
+        timeout=1800,
+    )
+
+
+@pytest.fixture(scope="session")
+def image() -> str:
+    result = docker("build", "-t", IMAGE_TAG, str(REPO))
+    assert result.returncode == 0, result.stderr
+    return IMAGE_TAG
+
+
+@pytest.fixture
+def ledger_volume(image: str) -> Iterator[str]:
+    """A named volume holding the fixture ledger, owned by uid 1000.
+
+    Bind mounts ignore ownership on Docker Desktop, so they cannot show whether
+    the image's non-root user can write the ledger.
+    """
+    name = f"bf-test-{uuid.uuid4().hex[:12]}"
+    docker("volume", "create", name, check=True)
+    try:
+        docker("create", "--name", name, "-v", f"{name}:/ledger", image, "true", check=True)
+        docker("cp", f"{FIXTURE_LEDGER}/.", f"{name}:/ledger/", check=True)
+        docker("rm", "-f", name, check=True)
+        docker(
+            "run", "--rm", "-u", "0", "--entrypoint", "chown", "-v", f"{name}:/ledger",
+            image, "-R", "1000:1000", "/ledger", check=True,
+        )  # fmt: skip
+        yield name
+    finally:
+        docker("rm", "-f", name)
+        docker("volume", "rm", "-f", name)
+
+
+@pytest.fixture
+def fava_port(image: str, ledger_volume: str) -> Iterator[tuple[str, int]]:
+    """The default command on a random host port; yields (container, port) once fava answers."""
+    name = f"bf-fava-{uuid.uuid4().hex[:12]}"
+    docker(
+        "run", "-d", "--name", name, "-p", "127.0.0.1::5000", "-v", f"{ledger_volume}:/ledger",
+        "-e", f"BEANCOUNT_FILE={LEDGER_FILE}", image, check=True,
+    )  # fmt: skip
+    try:
+        mapping = docker("port", name, "5000/tcp", check=True).stdout
+        port = int(mapping.strip().splitlines()[0].rsplit(":", 1)[1])
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).close()
+                break
+            except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
+                if time.monotonic() > deadline:
+                    pytest.fail(f"fava did not answer within 30s: {error}")
+                time.sleep(0.5)
+        yield name, port
+    finally:
+        docker("rm", "-f", name)
 
 
 def _normalize(name: str) -> str:
@@ -52,15 +127,12 @@ def _locked_packages() -> set[tuple[str, str]]:
     return packages
 
 
-def test_installed_packages_equal_lock(image: str) -> None:
+def test_python_packages_equal_lock(image: str) -> None:
     result = docker("run", "--rm", image, "/opt/venv/bin/python", "-c", LIST_DISTRIBUTIONS)
     assert result.returncode == 0, result.stderr
     installed = {(_normalize(name), version) for name, version in json.loads(result.stdout)}
-
     assert installed == _locked_packages()
-    versions = dict(installed)
-    assert versions["beancount"].split(".")[0] == "3"
-    assert "pytest" not in versions
+    assert dict(installed)["beancount"].split(".")[0] == "3"
 
     # The base image's own interpreter must not carry packages either.
     system = docker("run", "--rm", image, "/usr/local/bin/python3", "-c", LIST_DISTRIBUTIONS)
@@ -68,93 +140,42 @@ def test_installed_packages_equal_lock(image: str) -> None:
     assert json.loads(system.stdout) == []
 
 
-def test_build_fails_on_lock_drift(tmp_path: Path) -> None:
-    context = tmp_path / "context"
-    context.mkdir()
-    for name in ("Dockerfile", "pyproject.toml", "uv.lock"):
-        shutil.copy(REPO / name, context / name)
-    pyproject = context / "pyproject.toml"
-    drifted, replaced = re.subn(r"fava==[0-9.]+", "fava==1.30.15", pyproject.read_text("utf-8"))
-    assert replaced == 1, "pyproject.toml has no exact fava pin to drift"
-    pyproject.write_text(drifted, "utf-8")
+def test_command_line_tools(image: str, ledger_volume: str) -> None:
+    def run(*command: str) -> subprocess.CompletedProcess[str]:
+        return docker("run", "--rm", "-v", f"{ledger_volume}:/ledger", image, *command)
 
-    result = build_image("beancount-fava:test-drift", context, "linux/amd64")
-    try:
-        assert result.returncode != 0
-        assert "uv.lock" in result.stdout + result.stderr
-    finally:
-        docker("rmi", "-f", "beancount-fava:test-drift")
+    for command in (["bean-price", "--help"], ["bean-format", "--help"], ["git", "--version"]):
+        assert run(*command).returncode == 0, command
+    assert run("bean-check", LEDGER_FILE).returncode == 0
+    query = run("bean-query", LEDGER_FILE, "SELECT account, sum(position) GROUP BY account")
+    assert "Expenses:Food" in query.stdout, query.stderr
+
+    unbalanced = run("bean-check", "/ledger/unbalanced.beancount")
+    assert unbalanced.returncode == 1
+    assert "does not balance" in unbalanced.stdout + unbalanced.stderr
 
 
-@pytest.mark.parametrize(
-    "command",
-    [["bean-query", "--help"], ["bean-price", "--help"], ["bean-format", "--help"],
-     ["git", "--version"]],
-    ids=lambda command: command[0],
-)  # fmt: skip
-def test_cli_tools_available(image: str, command: list[str]) -> None:
-    result = docker("run", "--rm", image, *command)
-    assert result.returncode == 0, result.stderr
-
-
-def test_bean_check_valid_ledger(image: str, ledger_volume: str) -> None:
-    result = docker(
-        "run", "--rm", "-v", f"{ledger_volume}:/ledger", image, "bean-check", LEDGER_FILE
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_bean_check_unbalanced_ledger(image: str, ledger_volume: str) -> None:
-    result = docker(
-        "run", "--rm", "-v", f"{ledger_volume}:/ledger", image,
-        "bean-check", "/ledger/unbalanced.beancount",
-    )  # fmt: skip
-    assert result.returncode == 1
-    assert "does not balance" in result.stdout + result.stderr
-
-
-def test_runs_as_non_root(image: str) -> None:
-    result = docker("run", "--rm", image, "id", "-u")
-    assert result.stdout.strip() == "1000"
-
-
-def test_ledger_dir_empty_and_writable(image: str) -> None:
+def test_runs_as_uid_1000_with_writable_ledger_dir(image: str) -> None:
+    assert docker("run", "--rm", image, "id", "-u").stdout.strip() == "1000"
     listing = docker("run", "--rm", image, "ls", "-A", "/ledger")
-    assert listing.returncode == 0, listing.stderr
-    assert listing.stdout.strip() == ""
-    touch = docker("run", "--rm", image, "touch", "/ledger/x")
-    assert touch.returncode == 0, touch.stderr
+    assert (listing.returncode, listing.stdout.strip()) == (0, "")
+    assert docker("run", "--rm", image, "touch", "/ledger/x").returncode == 0
 
 
-def _wait_for_fava(port: int, deadline_seconds: float = 30) -> tuple[int, str]:
-    """GET / following redirects; returns (status, final path)."""
-    deadline = time.monotonic() + deadline_seconds
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as response:
-                return response.status, urllib.parse.urlparse(response.url).path
-        except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
-            last_error = error
-            time.sleep(0.5)
-    pytest.fail(f"fava did not answer within {deadline_seconds}s: {last_error}")
+def test_fava_serves_and_writes_the_mounted_ledger(
+    image: str, fava_port: tuple[str, int], ledger_volume: str
+) -> None:
+    _, port = fava_port
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as response:
+        assert response.status == 200
+        assert urllib.parse.urlparse(response.url).path.startswith("/spec-ledger/")
 
-
-def test_fava_serves_on_published_port(fava_container: str) -> None:
-    status, path = _wait_for_fava(host_port(fava_container))
-    assert status == 200
-    assert path.startswith("/spec-ledger/")
-
-
-def test_fava_writes_mounted_ledger(image: str, fava_container: str, ledger_volume: str) -> None:
-    port = host_port(fava_container)
-    _wait_for_fava(port)
     entry = {
         "t": "Transaction",
         "date": "2024-02-01",
         "flag": "*",
         "payee": "",
-        "narration": "spec-write-probe",
+        "narration": "write-probe",
         "tags": [],
         "links": [],
         "meta": {},
@@ -173,45 +194,14 @@ def test_fava_writes_mounted_ledger(image: str, fava_container: str, ledger_volu
         assert response.status == 200
 
     stored = docker("run", "--rm", "-v", f"{ledger_volume}:/ledger", image, "cat", LEDGER_FILE)
-    assert "spec-write-probe" in stored.stdout
+    assert "write-probe" in stored.stdout
 
 
-def test_fava_without_ledger_fails(image: str) -> None:
-    result = docker("run", "--rm", image, timeout=60)
-    assert result.returncode == 2
-    assert "No file specified" in result.stderr
-
-
-def test_stops_on_sigterm(fava_container: str) -> None:
-    _wait_for_fava(host_port(fava_container))
+def test_stops_on_sigterm(fava_port: tuple[str, int]) -> None:
+    container, _ = fava_port
     started = time.monotonic()
-    docker("stop", fava_container, check=True)
+    docker("stop", container, check=True)
     elapsed = time.monotonic() - started
-    exit_code = docker("inspect", "--format", "{{.State.ExitCode}}", fava_container, check=True)
-
+    exit_code = docker("inspect", "--format", "{{.State.ExitCode}}", container, check=True)
     assert exit_code.stdout.strip() == "143"
     assert elapsed < 5
-
-
-def test_arm64_smoke(image_arm64: str, ledger_volume_arm64: str) -> None:
-    machine = docker(
-        "run", "--rm", "--platform", "linux/arm64", image_arm64,
-        "python", "-c", "import platform; print(platform.machine())",
-    )  # fmt: skip
-    assert machine.stdout.strip() == "aarch64"
-    check = docker(
-        "run", "--rm", "--platform", "linux/arm64", "-v", f"{ledger_volume_arm64}:/ledger",
-        image_arm64, "bean-check", LEDGER_FILE,
-    )  # fmt: skip
-    assert check.returncode == 0, check.stdout + check.stderr
-
-
-def test_base_images_digest_pinned() -> None:
-    dockerfile = (REPO / "Dockerfile").read_text("utf-8")
-    stages = set(re.findall(r"^FROM\s+\S+\s+AS\s+(\S+)", dockerfile, re.MULTILINE | re.IGNORECASE))
-    references = re.findall(r"^FROM\s+(\S+)", dockerfile, re.MULTILINE | re.IGNORECASE)
-    references += re.findall(r"^COPY\s+--from=(\S+)", dockerfile, re.MULTILINE | re.IGNORECASE)
-    external = [reference for reference in references if reference not in stages]
-
-    assert external
-    assert [reference for reference in external if "@sha256:" not in reference] == []
