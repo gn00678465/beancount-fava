@@ -21,5 +21,5 @@ jobs:
       - run: uv run ruff format --check .
       - run: docker run --rm -i hadolint/hadolint < Dockerfile
       - run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint -color
-      - run: uv export --locked --no-dev --no-emit-project --format requirements-txt | uv run pip-audit --disable-pip --require-hashes -r /dev/stdin
+      - run: uv export --locked --no-dev --no-emit-project --format requirements-txt | uv run pip-audit --disable-pip --require-hashes --ignore-vuln PYSEC-2026-2447 -r /dev/stdin
       - run: uv run pytest

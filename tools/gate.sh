@@ -74,10 +74,13 @@ secrets_scan() {
   docker run --rm -v "$REPO_MOUNT:/repo" ghcr.io/gitleaks/gitleaks:latest git --no-banner /repo
 }
 
+# PYSEC-2026-2447 (diskcache, via beanprice) has no fixed release; the spec's
+# known limits record why it is accepted. Remove the ignore once one exists.
 supply_chain() {
   uv export --locked --no-dev --no-emit-project --format requirements-txt -q \
     -o "$ARTIFACTS/requirements.txt" &&
-    uv run pip-audit --disable-pip --require-hashes -r "$ARTIFACTS/requirements.txt"
+    uv run pip-audit --disable-pip --require-hashes --ignore-vuln PYSEC-2026-2447 \
+      -r "$ARTIFACTS/requirements.txt"
 }
 
 # Resolve and validate inputs before touching the previous run's artifacts.
