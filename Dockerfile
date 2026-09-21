@@ -19,9 +19,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 1000 --create-home fava \
     && install -d -o fava -g fava /ledger
+# Everything Python in this image comes from uv.lock; the base image's pip
+# would let the runtime user install more.
+RUN python -m pip uninstall --yes --root-user-action ignore pip
 COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH" \
-    FAVA_HOST=0.0.0.0
+ENV PATH="/opt/venv/bin:$PATH"
+ENV FAVA_HOST=0.0.0.0
 USER 1000:1000
 WORKDIR /ledger
 EXPOSE 5000

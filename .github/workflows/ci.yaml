@@ -6,6 +6,11 @@ on:
 permissions:
   contents: read
 
+# `bash` runs with pipefail; the default shell does not.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -21,5 +26,7 @@ jobs:
       - run: uv run ruff format --check .
       - run: docker run --rm -i hadolint/hadolint < Dockerfile
       - run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint -color
-      - run: uv export --locked --no-dev --no-emit-project --format requirements-txt | uv run pip-audit --disable-pip --require-hashes --ignore-vuln PYSEC-2026-2447 -r /dev/stdin
+      - run: uv export --locked --no-dev --no-emit-project --format requirements-txt -o "$RUNNER_TEMP/requirements.txt"
+      # Keep this ignore in step with tools/gate.sh; specs/image/SPEC.md records the reason.
+      - run: uv run pip-audit --disable-pip --require-hashes --ignore-vuln PYSEC-2026-2447 -r "$RUNNER_TEMP/requirements.txt"
       - run: uv run pytest

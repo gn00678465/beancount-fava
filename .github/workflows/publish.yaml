@@ -4,13 +4,19 @@ on:
   push:
     branches: [main]
 
-# A slower, older run must not move `latest` back after a newer one finished.
+# Runs queue, so an older run always finishes before a newer one and `latest`
+# ends on the newest commit. Cancelling instead could stop a run mid-push.
 concurrency:
   group: publish
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
+
+# `bash` runs with pipefail; the default shell does not.
+defaults:
+  run:
+    shell: bash
 
 env:
   IMAGE: gn00678465/beancount-fava
@@ -35,8 +41,12 @@ jobs:
             docker run --rm beancount-fava:test python -c \
               "from importlib.metadata import version; print(version('$1'))"
           }
-          echo "fava=$(installed fava)" >> "$GITHUB_OUTPUT"
-          echo "beancount=$(installed beancount)" >> "$GITHUB_OUTPUT"
+          # Assign first: a failed substitution inside `echo` would not stop the step.
+          fava=$(installed fava)
+          beancount=$(installed beancount)
+          test -n "$fava" && test -n "$beancount"
+          echo "fava=$fava" >> "$GITHUB_OUTPUT"
+          echo "beancount=$beancount" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
