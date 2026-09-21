@@ -1,7 +1,7 @@
 # SPEC — beancount v3 + fava 單一 image、Docker Hub 發佈、自動更新 (Tier 2)
 
 - `spec_version`: v1
-- `status`: draft
+- `status`: approved
 - `tier`: 2
 - `scope`: image
 - `base_ref`: 4fdf55bffa078446fed8b1415e0d25a995f03428
@@ -98,6 +98,8 @@
   - dev：`pytest`、`pytest-randomly`（隨機順序）、`ruff`、`pyyaml`（解析 workflow）、`pip-audit`。
 
 ## Approval
+
+- 2026-09-21 — approves v1 — "核准 v1"（對問題「您是否核准 specs/image/SPEC.md 的 spec_version v1（commit 886766b）？」的選擇。同一次詢問中，額外套件的解讀得到的回答是「正確，加裝 beanprice 和 git」。）
 
 ## Revisions
 
