@@ -22,7 +22,7 @@ RUN apt-get update \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH" \
     FAVA_HOST=0.0.0.0
-USER fava
+USER 1000:1000
 WORKDIR /ledger
 EXPOSE 5000
 ENTRYPOINT ["tini", "--"]
