@@ -3,44 +3,75 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import yaml
-from conftest import REPO
+from conftest import IMAGE_TAG, REPO
 
 WORKFLOWS = REPO / ".github" / "workflows"
-PUBLISH_MARKERS = ("secrets.DOCKERHUB_", "docker/login-action", "push: true")
 AUTOMERGE_ALLOWLIST = {"patch", "minor", "digest", "pin", "pinDigest"}
 
 
-def _workflows() -> dict[str, Path]:
-    return {path.name: path for path in [*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")]}
+def _workflows() -> dict[str, dict[str, Any]]:
+    paths = [*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")]
+    return {path.name: yaml.safe_load(path.read_text("utf-8")) for path in paths}
 
 
-def _triggers(workflow: Path) -> Any:
-    document = yaml.safe_load(workflow.read_text("utf-8"))
+def _triggers(workflow: dict[str, Any]) -> Any:
     # YAML 1.1 reads the bare key `on` as the boolean true.
-    return document.get("on", document.get(True))
+    return workflow.get("on", workflow.get(True))
+
+
+def _steps(workflow: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    for job in workflow["jobs"].values():
+        yield from job.get("steps", [])
+
+
+def _publish_capabilities(workflow: dict[str, Any]) -> list[str]:
+    """Everything in a workflow that could push an image or read a secret."""
+    found = []
+    if "secrets" in json.dumps(workflow):
+        found.append("secrets reference")
+    for step in _steps(workflow):
+        if "docker/login-action" in step.get("uses", ""):
+            found.append("docker/login-action")
+        if step.get("with", {}).get("push", False) is not False:
+            found.append("push input")
+        if "docker push" in step.get("run", ""):
+            found.append("docker push")
+    return found
+
+
+def _run_lines(workflow: dict[str, Any]) -> str:
+    return "\n".join(step.get("run", "") for step in _steps(workflow))
 
 
 def test_only_publish_workflow_pushes() -> None:
     workflows = _workflows()
     assert {"ci.yaml", "publish.yaml"} <= set(workflows)
 
-    for name, path in workflows.items():
-        text = path.read_text("utf-8")
-        assert "pull_request_target" not in text, name
+    for name, workflow in workflows.items():
+        assert "pull_request_target" not in json.dumps(_triggers(workflow)), name
+        # `bash` adds pipefail; the default shell lets a failed pipe stage pass.
+        assert workflow["defaults"]["run"]["shell"] == "bash", name
         if name != "publish.yaml":
-            assert [marker for marker in PUBLISH_MARKERS if marker in text] == [], name
+            assert _publish_capabilities(workflow) == [], name
 
-    publish_text = workflows["publish.yaml"].read_text("utf-8")
-    assert [marker for marker in PUBLISH_MARKERS if marker not in publish_text] == []
-    assert _triggers(workflows["publish.yaml"]) == {"push": {"branches": ["main"]}}
-    publish = yaml.safe_load(publish_text)
-    assert publish["concurrency"]["cancel-in-progress"] is True
+    publish = workflows["publish.yaml"]
+    assert {"docker/login-action", "push input"} <= set(_publish_capabilities(publish))
+    assert _triggers(publish) == {"push": {"branches": ["main"]}}
+    # Runs queue instead of cancelling: a cancel mid-push leaves tags inconsistent.
+    assert publish["concurrency"]["group"]
+    assert publish["concurrency"]["cancel-in-progress"] is False
+    assert IMAGE_TAG in _run_lines(publish)
 
-    assert "pull_request" in _triggers(workflows["ci.yaml"])
+    ci = workflows["ci.yaml"]
+    assert "pull_request" in _triggers(ci)
+    ci_commands = _run_lines(ci)
+    assert "uv run pytest" in ci_commands
+    assert "pip-audit" in ci_commands
 
 
 def test_renovate_automerge_allowlist() -> None:
@@ -56,6 +87,18 @@ def test_renovate_automerge_allowlist() -> None:
             assert rule.get("matchUpdateTypes"), rule
             automerged |= set(rule["matchUpdateTypes"])
     assert automerged == AUTOMERGE_ALLOWLIST
+
+    # Transitive dependencies (e.g. a fixed diskcache) only arrive this way.
+    maintenance = config.get("lockFileMaintenance", {})
+    assert maintenance.get("enabled") is True
+    assert not maintenance.get("automerge")
+
+    # A new Python minor must be a manual decision, not an automerged "minor".
+    python_rules = [
+        rule for rule in config.get("packageRules", [])
+        if rule.get("matchPackageNames") == ["python"] and rule.get("allowedVersions")
+    ]  # fmt: skip
+    assert len(python_rules) == 1
 
     npx = shutil.which("npx")
     assert npx, "npx is required to run renovate-config-validator"

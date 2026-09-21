@@ -62,6 +62,11 @@ def test_installed_packages_equal_lock(image: str) -> None:
     assert versions["beancount"].split(".")[0] == "3"
     assert "pytest" not in versions
 
+    # The base image's own interpreter must not carry packages either.
+    system = docker("run", "--rm", image, "/usr/local/bin/python3", "-c", LIST_DISTRIBUTIONS)
+    assert system.returncode == 0, system.stderr
+    assert json.loads(system.stdout) == []
+
 
 def test_build_fails_on_lock_drift(tmp_path: Path) -> None:
     context = tmp_path / "context"
@@ -76,6 +81,7 @@ def test_build_fails_on_lock_drift(tmp_path: Path) -> None:
     result = build_image("beancount-fava:test-drift", context, "linux/amd64")
     try:
         assert result.returncode != 0
+        assert "uv.lock" in result.stdout + result.stderr
     finally:
         docker("rmi", "-f", "beancount-fava:test-drift")
 

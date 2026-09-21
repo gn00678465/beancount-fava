@@ -10,6 +10,8 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 FIXTURE_LEDGER = REPO / "tests" / "fixtures" / "ledger"
 LEDGER_FILE = "/ledger/main.beancount"
+# publish.yaml reads versions from this tag after the suite built and tested it.
+IMAGE_TAG = "beancount-fava:test"
 
 
 def docker(
@@ -38,7 +40,7 @@ def _built(tag: str, platform: str) -> str:
 
 @pytest.fixture(scope="session")
 def image() -> str:
-    return _built("beancount-fava:test", "linux/amd64")
+    return _built(IMAGE_TAG, "linux/amd64")
 
 
 @pytest.fixture(scope="session")
