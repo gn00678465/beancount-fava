@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+# `bash` runs with pipefail; the default shell does not.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: docker run --rm -i hadolint/hadolint < Dockerfile
+      - run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint -color
+      - run: uv export --locked --no-dev --no-emit-project --format requirements-txt -o "$RUNNER_TEMP/requirements.txt"
+      # PYSEC-2026-2447: diskcache 5.6.3 (via beanprice) has no fixed release. Exploiting it needs
+      # write access to the runtime user's cache directory. Remove the ignore once a fix ships.
+      - run: uv run pip-audit --disable-pip --require-hashes --ignore-vuln PYSEC-2026-2447 -r "$RUNNER_TEMP/requirements.txt"
+      - run: uv run pytest
