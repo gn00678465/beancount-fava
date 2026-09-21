@@ -1,0 +1,6 @@
+2024-01-01 open Assets:Cash TWD
+2024-01-01 open Expenses:Food TWD
+
+2024-01-05 * "Shop" "unbalanced"
+  Expenses:Food     120 TWD
+  Assets:Cash      -100 TWD

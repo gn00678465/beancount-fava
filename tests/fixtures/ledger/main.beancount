@@ -1,0 +1,8 @@
+option "title" "Spec Ledger"
+option "operating_currency" "TWD"
+
+include "accounts.beancount"
+
+2024-01-05 * "Shop" "fixture-purchase"
+  Expenses:Food     120 TWD
+  Assets:Cash      -120 TWD

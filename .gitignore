@@ -1,0 +1,4 @@
+.claude/
+.gate/
+.venv/
+__pycache__/
