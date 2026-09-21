@@ -197,6 +197,26 @@ def test_fava_serves_and_writes_the_mounted_ledger(
     assert "write-probe" in stored.stdout
 
 
+def test_missing_ledger_file_fails_at_start(image: str) -> None:
+    # fava itself starts anyway and serves a blank page: it sends `filename: null`,
+    # which its own frontend rejects ("Validation of object failed at key options").
+    name = f"bf-missing-{uuid.uuid4().hex[:12]}"
+    docker(
+        "run", "-d", "--name", name, "-e", "BEANCOUNT_FILE=/ledger/missing.beancount", image,
+        check=True,
+    )  # fmt: skip
+    try:
+        deadline = time.monotonic() + 20
+        while docker("inspect", "--format", "{{.State.Running}}", name).stdout.strip() == "true":
+            assert time.monotonic() < deadline, "container is still running with a missing ledger"
+            time.sleep(0.5)
+        exit_code = docker("inspect", "--format", "{{.State.ExitCode}}", name).stdout.strip()
+        assert exit_code == "1"
+        assert "/ledger/missing.beancount" in docker("logs", name).stderr
+    finally:
+        docker("rm", "-f", name)
+
+
 def test_stops_on_sigterm(fava_port: tuple[str, int]) -> None:
     container, _ = fava_port
     started = time.monotonic()
