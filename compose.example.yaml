@@ -1,0 +1,15 @@
+# Example. Copy it to compose.yaml next to a `ledger/` folder that holds
+# main.beancount, then run `docker compose up -d` and open http://127.0.0.1:5000.
+# fava has no authentication, so the port is bound to loopback only.
+services:
+  fava:
+    image: gn00678465/beancount-fava:1.30.16-beancount3.2.3@sha256:b77b0a1c964439cb4dd31b006f459318f60f10a910074a3d6059ae0ccaac8be4
+    environment:
+      BEANCOUNT_FILE: /ledger/main.beancount
+    volumes:
+      # The image runs as uid 1000; fava can save edits only when that uid can
+      # write the ledger files.
+      - ./ledger:/ledger
+    ports:
+      - "127.0.0.1:5000:5000"
+    restart: unless-stopped
