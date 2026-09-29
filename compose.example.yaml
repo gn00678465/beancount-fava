@@ -3,7 +3,7 @@
 # fava has no authentication, so the port is bound to loopback only.
 services:
   fava:
-    image: gn00678465/beancount-fava:1.30.16-beancount3.2.3@sha256:308046e32ed8ae006680b6fd28f6d39363eb6c850c6dafb840631b65269afa56
+    image: gn00678465/beancount-fava:1.30.16-beancount3.2.3@sha256:c68d64cae7f68bfb2eb572d57c0cd9e8ea399720e709e945ec0fa7898d8e68c6
     environment:
       BEANCOUNT_FILE: /ledger/main.beancount
     volumes:
