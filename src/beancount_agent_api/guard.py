@@ -33,6 +33,7 @@ POLICY = (
     Rule(Principal.BROWSER, None, re.compile(r"/.*")),
     Rule(Principal.AGENT, "GET", re.compile(r"/[^/]+/api/[^/]+")),
     Rule(Principal.AGENT, "POST", re.compile(r"/[^/]+/extension/AgentApi/[^/]+")),
+    Rule(Principal.AGENT, None, re.compile(r"/[^/]+/extension/AgentApi/mcp")),
 )
 
 
