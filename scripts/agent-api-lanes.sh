@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# Live lanes and perf probes for docs/plans/agent-write-api.md (AGENT-1 guard, AGENT-2 writes).
+# Live lanes and perf probes for docs/plans/agent-write-api.md (AGENT-1 guard, AGENT-2 writes, AGENT-3 MCP).
 #
 #   images               build $HEAD_IMAGE from this checkout and $TRUNK_IMAGE from $TRUNK_REF
 #   boot <n> [target]    start a JWKS stub and fava for worker <n>; target is head or trunk
 #   jwt <n> <claims>     sign a JWT for worker <n>'s stub; optional key and kid follow
-#   down <n>             remove worker <n>'s containers and network
+#   down <n>             remove worker <n>'s containers, network, and recording proxy
 #   lane <n>             run guard lane <n> against $TARGET (head by default)
 #   perf-guard           interleave trunk and head, 20 rounds each
 #   all                  images, guard lanes 1-10, perf-guard
 #   write-lane <n>       run write-endpoint lane <n> against $TARGET (head by default)
 #   perf-write           interleave trunk and head home pages and head writes, 20 rounds each
 #   write-all            images, write lanes 1-10, perf-write
+#   mcp-lane <n>         run MCP lane <n> against $TARGET (head by default); lane 1 boots trunk and head
+#   perf-mcp             interleave head REST and MCP writes, 20 rounds each, plus trunk REST for reference
+#   mcp-all              images, MCP lanes 1-10, perf-mcp
 #
+# Container and network names start with $LANES_PREFIX (default lanes).
 # Transcripts land in $LANES_OUT/worker-<n>/<slug>.txt (trunk runs: trunk-<slug>.txt).
 set -euo pipefail
 
@@ -23,13 +27,14 @@ OUT=${LANES_OUT:-/tmp/swarm-agent-1}
 TARGET=${TARGET:-head}
 AUD=lane-aud
 BFILE=agent
+PREFIX=${LANES_PREFIX:-lanes}
 
 image_for() { if [ "$1" = trunk ]; then echo "$TRUNK_IMAGE"; else echo "$HEAD_IMAGE"; fi; }
 wdir() { echo "$OUT/worker-$1"; }
 idir() { echo "$(wdir "$1")/$2"; }
-net() { echo "lanes-w$1"; }
-stub() { echo "lanes-w$1-jwks"; }
-fava() { echo "lanes-w$1-$2"; }
+net() { echo "$PREFIX-w$1"; }
+stub() { echo "$PREFIX-w$1-jwks"; }
+fava() { echo "$PREFIX-w$1-$2"; }
 team_domain() { echo "http://$(stub "$1"):8000"; }
 port() { cat "$(idir "$1" "$2")/port"; }
 token() { cat "$(wdir "$1")/token"; }
@@ -141,7 +146,8 @@ cmd_boot() {
 
 cmd_down() {
   local n=$1
-  docker ps -aq --filter "name=^lanes-w$n-" | xargs -r docker rm -f >/dev/null
+  recording_proxy_stop "$n"
+  docker ps -aq --filter "name=^$PREFIX-w$n-" | xargs -r docker rm -f >/dev/null
   docker network rm "$(net "$n")" >/dev/null 2>&1 || true
 }
 
@@ -167,7 +173,7 @@ request() {
     "http://127.0.0.1:$(port "$n" "$target")$path")
   {
     echo "\$ curl -X $method $(short "$@")http://127.0.0.1:<$target>$path"
-    grep -iE '^(HTTP/|www-authenticate|location|content-type)' "$headers" | tr -d '\r' | sed 's/^/< /'
+    grep -iE '^(HTTP/|www-authenticate|location|content-type|allow:)' "$headers" | tr -d '\r' | sed 's/^/< /'
     echo "< body: $(wc -c <"$BODY") bytes, sha256 $(sha256sum "$BODY" | cut -c1-16)"
     head -c 1200 "$BODY" | tr -d '\r'
     echo
@@ -230,14 +236,22 @@ lane2() {
   cmd_boot 2 "$TARGET"
   local query=(-G --data-urlencode 'query_string=SELECT account, sum(position) GROUP BY account')
   local path want
+  sha_without_load_noise() {
+    if [ "$1" = ledger_data ]; then
+      jq -S 'del(.data.errors, .data.extensions)' "$BODY" | sha256sum | cut -d' ' -f1
+    else
+      sha256sum "$BODY" | cut -d' ' -f1
+    fi
+  }
+  note "ledger_data is compared without .data.errors and .data.extensions; query byte for byte"
   for path in ledger_data query; do
     local args=()
     [ "$path" = query ] && args=("${query[@]}")
     request 2 trunk GET "/$BFILE/api/$path" "${args[@]}"
-    want=$(sha256sum "$BODY" | cut -d' ' -f1)
+    want=$(sha_without_load_noise "$path")
     request 2 "$TARGET" GET "/$BFILE/api/$path" -H "$(bearer 2)" "${args[@]}"
     check "$path with token" "$STATUS" 200
-    check "$path body equals trunk without guard" "$(sha256sum "$BODY" | cut -d' ' -f1)" "$want"
+    check "$path body equals trunk without guard" "$(sha_without_load_noise "$path")" "$want"
   done
   end_lane 2
 }
@@ -721,6 +735,446 @@ cmd_perf_write() {
   echo "perf-write: $result  $TRANSCRIPT"
 }
 
+MCP_PATH="/$BFILE/extension/AgentApi/mcp"
+MCP_VERSION=2026-07-28
+
+mcp_body() {
+  jq -nc --arg method "$1" --argjson params "$2" --arg version "$MCP_VERSION" '{
+    jsonrpc: "2.0", id: 1, method: $method,
+    params: ($params | ._meta = (._meta // {}) + {
+      "io.modelcontextprotocol/protocolVersion": $version,
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "io.modelcontextprotocol/clientInfo": {name: "agent-api-lanes", version: "1"}})}'
+}
+
+tool_call_body() {
+  mcp_body tools/call "$(jq -nc --arg name "$1" --argjson arguments "$2" '{name: $name, arguments: $arguments}')"
+}
+
+mcp_headers() {
+  MCP_HEADERS=(-H "$(bearer "$1")" -H 'Content-Type: application/json'
+    -H 'Accept: application/json, text/event-stream' -H "MCP-Protocol-Version: $MCP_VERSION" -H "Mcp-Method: $2")
+  [ -z "${3:-}" ] || MCP_HEADERS+=(-H "Mcp-Name: $3")
+}
+
+mcp_post() {
+  local n=$1 target=$2 method=$3 name=$4 body=$5
+  shift 5
+  mcp_headers "$n" "$method" "$name"
+  note "request body: $body"
+  request "$n" "$target" POST "$MCP_PATH" "${MCP_HEADERS[@]}" --data-binary "$body" "$@"
+}
+
+header() { grep -i "^$2:" "$(wdir "$1")/last-headers" | tr -d '\r' | sed 's/^[^:]*: *//' | tail -1; }
+
+mcp_log_lines() { docker logs "$(fava "$1" "$2")" 2>&1 | grep '^mcp ' || true; }
+
+recording_proxy_start() {
+  local n=$1 target=$2 w deadline
+  w=$(wdir "$n")
+  recording_proxy_stop "$n"
+  : >"$w/proxy.log"
+  rm -f "$w/proxy.port"
+  cat >"$w/proxy.py" <<'PY'
+import http.client
+import http.server
+import os
+import sys
+import threading
+
+UPSTREAM = int(sys.argv[1])
+LOG, PORT_FILE = sys.argv[2], sys.argv[3]
+HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+              "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"}
+LOCK = threading.Lock()
+
+
+def clip(data):
+    return data[:400].decode("utf-8", "replace").replace("\r", "\\r").replace("\n", "\\n")
+
+
+def forwardable(headers):
+    drop = HOP_BY_HOP | {"content-length"}
+    drop |= {name.strip().lower() for name in headers.get("Connection", "").split(",")}
+    return [(name, value) for name, value in headers.items() if name.lower() not in drop]
+
+
+class Proxy(http.server.BaseHTTPRequestHandler):
+    def read_body(self):
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            chunks = []
+            while size := int(self.rfile.readline().split(b";")[0], 16):
+                chunks.append(self.rfile.read(size))
+                self.rfile.readline()
+            while self.rfile.readline().strip():
+                pass
+            return b"".join(chunks)
+        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+    def forward(self):
+        body = self.read_body()
+        try:
+            upstream = http.client.HTTPConnection("127.0.0.1", UPSTREAM, timeout=120)
+            upstream.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
+            for name, value in forwardable(self.headers):
+                upstream.putheader(name, value)
+            if body or "Content-Length" in self.headers or "Transfer-Encoding" in self.headers:
+                upstream.putheader("Content-Length", str(len(body)))
+            upstream.endheaders(body)
+            response = upstream.getresponse()
+            status, reason, data = response.status, response.reason, response.read()
+            headers = forwardable(response.headers)
+            upstream.close()
+        except OSError as error:
+            status, reason, headers, data = 502, "Bad Gateway", [], str(error).encode()
+        self.record(body, status, data)
+        self.send_response_only(status, reason)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def record(self, body, status, data):
+        lines = [f"{self.command} {self.path}"]
+        for name in ("Mcp-Method", "Mcp-Name", "MCP-Protocol-Version", "Origin"):
+            lines.append(f"  {name}: {self.headers.get(name, '-')}")
+        lines.append("  Authorization: " + ("present" if "Authorization" in self.headers else "absent"))
+        lines += [f"  request: {clip(body)}", f"  status: {status}", f"  response: {clip(data)}", "", ""]
+        with LOCK, open(LOG, "a", encoding="utf-8") as log:
+            log.write("\n".join(lines))
+
+
+for method in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+    setattr(Proxy, f"do_{method}", Proxy.forward)
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+with open(PORT_FILE + ".tmp", "w") as out:
+    out.write(str(server.server_address[1]))
+os.replace(PORT_FILE + ".tmp", PORT_FILE)
+server.serve_forever()
+PY
+  python3 "$w/proxy.py" "$(port "$n" "$target")" "$w/proxy.log" "$w/proxy.port" </dev/null >"$w/proxy.err" 2>&1 &
+  echo $! >"$w/proxy.pid"
+  deadline=$((SECONDS + 10))
+  until [ -s "$w/proxy.port" ]; do
+    ((SECONDS < deadline)) || { cat "$w/proxy.err" >&2; echo "proxy for worker $n did not start" >&2; return 1; }
+    sleep 0.1
+  done
+}
+
+recording_proxy_stop() {
+  local pid
+  pid="$(wdir "$1")/proxy.pid"
+  [ -f "$pid" ] || return 0
+  kill "$(cat "$pid")" 2>/dev/null || true
+  rm -f "$pid"
+}
+
+recording_proxy_statuses() { awk '/^  status: / {print $2}' "$(wdir "$1")/proxy.log" | sort -u | paste -sd' '; }
+
+# A throwaway CLAUDE_CONFIG_DIR and the worker dir as cwd keep the operator's config and any project
+# .mcp.json out of `claude mcp add` and `claude mcp list`.
+mcp_list() {
+  local n=$1 target=$2 tag=$3 w cfg url
+  shift 3
+  w=$(wdir "$n")
+  cfg="$w/claude-$tag"
+  rm -rf "$cfg"
+  mkdir -p "$cfg"
+  recording_proxy_start "$n" "$target"
+  url="http://127.0.0.1:$(cat "$w/proxy.port")$MCP_PATH"
+  note "\$ claude mcp add --transport http beancount http://127.0.0.1:<proxy to $target>$MCP_PATH $(short "$@")"
+  (cd "$w" && CLAUDE_CONFIG_DIR="$cfg" claude mcp add --transport http beancount "$url" "$@") \
+    </dev/null >>"$TRANSCRIPT" 2>&1 || note "claude mcp add exit status: $?"
+  note "\$ claude mcp list"
+  (cd "$w" && CLAUDE_CONFIG_DIR="$cfg" timeout 120 claude mcp list) </dev/null >"$w/mcp-list.txt" 2>&1 || true
+  recording_proxy_stop "$n"
+  cat "$w/mcp-list.txt" >>"$TRANSCRIPT"
+  note "proxy log ($target):"
+  cat "$w/proxy.log" >>"$TRANSCRIPT"
+  MCP_LINE=$(grep '^beancount: ' "$w/mcp-list.txt" || true)
+}
+
+STREAM_EVENTS='fromjson? |
+  if .type == "assistant" then .message.content[]? | select(.type == "tool_use") | {kind: "tool_use", id, name, input}
+  elif .type == "user" then .message.content[]? | select(.type == "tool_result") | {kind: "tool_result",
+    id: .tool_use_id,
+    text: (if (.content | type) == "string" then .content else [.content[]? | select(.type == "text") | .text] | join("\n") end)}
+  elif .type == "result" then {kind: "result", text: .result}
+  else empty end'
+
+claude_run() {
+  local n=$1 target=$2 slug=$3 tools=$4 prompt=$5 w config allowed status=0
+  shift 5
+  w=$(wdir "$n")
+  allowed=$(sed 's/[^,]*/mcp__beancount__&/g' <<<"$tools")
+  config=$(jq -nc --arg url "http://127.0.0.1:$(port "$n" "$target")$MCP_PATH" --arg auth "Bearer $(token "$n")" \
+    '{mcpServers: {beancount: {type: "http", url: $url, headers: {Authorization: $auth}}}}')
+  note "\$ claude -p <prompt> --model haiku --tools '' --setting-sources '' --strict-mcp-config --mcp-config <beancount at <$target>$MCP_PATH> --allowedTools $allowed $(short "$@")"
+  note "prompt: $prompt"
+  (cd "$w" && timeout 300 claude -p "$prompt" --model haiku --tools '' --setting-sources '' \
+    --strict-mcp-config --mcp-config "$config" --allowedTools "$allowed" \
+    --output-format stream-json --verbose --no-session-persistence "$@") \
+    </dev/null >"$w/$slug.jsonl" 2>"$w/$slug.stderr" || status=$?
+  note "claude exit status: $status (raw stream $w/$slug.jsonl)"
+  CLAUDE_EVENTS="$w/$slug.events"
+  jq -cR "$STREAM_EVENTS" "$w/$slug.jsonl" >"$CLAUDE_EVENTS"
+  jq -r 'if .kind == "tool_use" then "tool_use \(.name) \(.input | tojson)"
+    elif .kind == "tool_result" then "tool_result \((.text // "")[0:1500])"
+    else "result: \(.text)" end' "$CLAUDE_EVENTS" >>"$TRANSCRIPT"
+}
+
+claude_text() { jq -r --arg kinds "$1" 'select(.kind | test("^(\($kinds))$")) | .text // empty' "$CLAUDE_EVENTS"; }
+
+claude_calls() {
+  jq -cs --arg name "mcp__beancount__$1" 'map(select(.kind == "tool_use" and .name == $name))' "$CLAUDE_EVENTS"
+}
+
+mlane1() {
+  start_lane 1 lane1-regression
+  cmd_boot 1 trunk
+  cmd_boot 1 head
+  note "claude --version: $(claude --version)"
+  local log mcp_lines
+  log=$(wdir 1)/proxy.log
+  mcp_list 1 trunk trunk --header "$(bearer 1)"
+  check "trunk: mcp list names beancount" "$(yes_no test -n "$MCP_LINE")" yes
+  check "trunk: beancount is connected" "$(yes_no grep -qF '✔ Connected' <<<"$MCP_LINE")" no
+  mcp_list 1 head head --header "$(bearer 1)"
+  check "head: beancount is connected" \
+    "$(yes_no grep -qE '^beancount: .*\(HTTP\) - ✔ Connected' <<<"$MCP_LINE")" yes
+  check "head: server/discover answered with supportedVersions [\"$MCP_VERSION\"]" "$(yes_no awk -v RS= -v path="$MCP_PATH" '
+    index($0, "POST " path "\n") == 1 && /\n  Mcp-Method: server\/discover\n/ &&
+    /"supportedVersions": ?\[ ?"2026-07-28" ?\]/ {found = 1}
+    END {exit !found}' "$log")" yes
+  check "head: a later request carries MCP-Protocol-Version: $MCP_VERSION" "$(yes_no awk -v RS= '
+    !discover && /\n  Mcp-Method: server\/discover\n/ {discover = NR; next}
+    discover && /\n  MCP-Protocol-Version: 2026-07-28\n/ {found = 1}
+    END {exit !found}' "$log")" yes
+  mcp_lines=$(mcp_log_lines 1 head)
+  note "head container log, lines starting with 'mcp ':"
+  note "$mcp_lines"
+  check "head: container log has 'mcp server/discover'" "$(yes_no grep -q '^mcp server/discover' <<<"$mcp_lines")" yes
+  end_lane 1
+}
+
+mlane2() {
+  start_lane 2 lane2-tools-list
+  cmd_boot 2 "$TARGET"
+  mcp_post 2 "$TARGET" tools/list "" "$(mcp_body tools/list '{}')"
+  check "tools/list" "$STATUS" 200
+  check "tool names" "$(field '[.result.tools[].name] | join(" ")')" "list_accounts query add_transaction"
+  check "resultType" "$(field .result.resultType)" complete
+  check "ttlMs type" "$(field '.result.ttlMs | type')" number
+  check "cacheScope" "$(field .result.cacheScope)" private
+  end_lane 2
+}
+
+mlane3() {
+  start_lane 3 lane3-read-tools
+  cmd_boot 3 "$TARGET"
+  local calls query_string mcp_rows
+  claude_run 3 "$TARGET" lane3-read-tools list_accounts,query \
+    "Call the list_accounts tool. Then call the query tool with query_string exactly: SELECT account, sum(position) GROUP BY account
+Then print every account name with its name-zh alias, and the query rows."
+  check "list_accounts called" "$(claude_calls list_accounts | jq 'length > 0')" true
+  calls=$(claude_calls query)
+  check "query called" "$(jq 'length > 0' <<<"$calls")" true
+  check "output contains Assets:TW:Cash" "$(yes_no grep -qF 'Assets:TW:Cash' <(claude_text 'tool_result|result'))" yes
+  check "output contains 錢包" "$(yes_no grep -qF '錢包' <(claude_text 'tool_result|result'))" yes
+  request 3 "$TARGET" GET "/$BFILE/api/ledger_data" -H "$(bearer 3)"
+  check "/api/ledger_data" "$STATUS" 200
+  query_string=$(jq -r '.[0].input.query_string // ""' <<<"$calls")
+  mcp_rows=$(jq -cS --arg id "$(jq -r '.[0].id // ""' <<<"$calls")" \
+    'select(.kind == "tool_result" and .id == $id) | .text | fromjson? | .data.rows' "$CLAUDE_EVENTS")
+  request 3 "$TARGET" GET "/$BFILE/api/query" -H "$(bearer 3)" -G --data-urlencode "query_string=$query_string"
+  check "/api/query" "$STATUS" 200
+  note "rows from the MCP query tool: $mcp_rows"
+  check "MCP query rows equal /api/query rows" "$mcp_rows" "$(jq -cS .data.rows "$BODY" 2>/dev/null || true)"
+  end_lane 3
+}
+
+mlane4() {
+  start_lane 4 lane4-dry-run
+  cmd_boot 4 "$TARGET"
+  local before
+  before=$(tree_sha 4 "$TARGET")
+  claude_run 4 "$TARGET" lane4-dry-run add_transaction \
+    'Call add_transaction once with exactly these arguments: date "2026-09-24", source "錢包", target "晚餐", amount "190", key "lane4", dry_run true. Then show the entry text from the result verbatim.'
+  check "add_transaction called with dry_run true" \
+    "$(claude_calls add_transaction | jq 'any(.[]; .input.dry_run == true)')" true
+  check "tool result holds the entry header" \
+    "$(yes_no grep -qF '2026-09-24 ! ^ik-lane4' <(claude_text tool_result))" yes
+  check "final text shows Expenses:Food:Dinner" "$(yes_no grep -qF 'Expenses:Food:Dinner' <(claude_text result))" yes
+  check "ledger unchanged" "$(tree_sha 4 "$TARGET")" "$before"
+  end_lane 4
+}
+
+mlane5() {
+  start_lane 5 lane5-add
+  cmd_boot 5 "$TARGET"
+  local fixture added headers mcp_lines
+  fixture="$REPO/tests/fixtures/agent-ledger/$TXNS"
+  claude_run 5 "$TARGET" lane5-add list_accounts,query,add_transaction '記錄「9/24 晚餐 190（錢包）」' \
+    --append-system-prompt "You record expenses in the user's beancount ledger through the beancount MCP tools."
+  note "\$ diff -u <fixture>/$TXNS <ledger>/$TXNS"
+  diff -u "$fixture" "$(txns_file 5 "$TARGET")" >>"$TRANSCRIPT" || true
+  added=$(diff "$fixture" "$(txns_file 5 "$TARGET")" | sed -n 's/^> //p' || true)
+  headers=$(grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' <<<"$added" || true)
+  check "transactions added" "$(grep -c . <<<"$headers" || true)" 1
+  check "added header starts with 2026-09-24 !" "$(cut -c1-12 <<<"$headers")" "2026-09-24 !"
+  check "posting Expenses:Food:Dinner 190 TWD" \
+    "$(yes_no grep -qE '^ +Expenses:Food:Dinner +190 TWD$' <<<"$added")" yes
+  check "posting Assets:TW:Cash" "$(yes_no grep -qE '^ +Assets:TW:Cash( |$)' <<<"$added")" yes
+  mcp_lines=$(mcp_log_lines 5 "$TARGET")
+  note "container log, lines starting with 'mcp ':"
+  note "$mcp_lines"
+  check "container log has 'mcp tools/call add_transaction'" \
+    "$(yes_no grep -q '^mcp tools/call add_transaction' <<<"$mcp_lines")" yes
+  end_lane 5
+}
+
+mlane6() {
+  start_lane 6 lane6-shared-key
+  cmd_boot 6 "$TARGET"
+  post 6 "$TARGET" "$(dinner shared)" -H "$(bearer 6)"
+  check "REST write" "$STATUS" 201
+  mcp_post 6 "$TARGET" tools/call add_transaction "$(tool_call_body add_transaction "$(dinner shared)")"
+  check "MCP add_transaction" "$STATUS" 200
+  check "isError" "$(field .result.isError)" false
+  check "created" "$(field .result.structuredContent.created)" false
+  check "^ik-shared occurrences in the ledger" "$(link_count 6 "$TARGET" ik-shared)" 1
+  end_lane 6
+}
+
+mlane7() {
+  start_lane 7 lane7-wrong-token
+  cmd_boot 7 "$TARGET"
+  mcp_list 7 "$TARGET" wrong --header "Authorization: Bearer wrong-token"
+  check "mcp list names beancount" "$(yes_no test -n "$MCP_LINE")" yes
+  check "beancount is connected" "$(yes_no grep -qF '✔ Connected' <<<"$MCP_LINE")" no
+  check "proxy saw a POST to $MCP_PATH" "$(yes_no grep -qxF "POST $MCP_PATH" "$(wdir 7)/proxy.log")" yes
+  check "every proxied status" "$(recording_proxy_statuses 7)" 401
+  note "container log tail:"
+  docker logs --tail 20 "$(fava 7 "$TARGET")" >>"$TRANSCRIPT" 2>&1
+  end_lane 7
+}
+
+mlane8() {
+  start_lane 8 lane8-no-token
+  cmd_boot 8 "$TARGET"
+  local before log
+  before=$(tree_sha 8 "$TARGET")
+  log=$(wdir 8)/proxy.log
+  mcp_list 8 "$TARGET" none
+  check "mcp list names beancount" "$(yes_no test -n "$MCP_LINE")" yes
+  check "beancount is connected" "$(yes_no grep -qF '✔ Connected' <<<"$MCP_LINE")" no
+  check "proxy saw a /.well-known/ path" "$(yes_no grep -qE '^[A-Z]+ /\.well-known/' "$log")" yes
+  check "proxy saw POST /register" "$(yes_no grep -qxF 'POST /register' "$log")" yes
+  check "every proxied status" "$(recording_proxy_statuses 8)" 401
+  check "ledger unchanged" "$(tree_sha 8 "$TARGET")" "$before"
+  end_lane 8
+}
+
+mlane9() {
+  start_lane 9 lane9-protocol-errors
+  cmd_boot 9 "$TARGET"
+  local method
+  for method in initialize resources/list; do
+    mcp_post 9 "$TARGET" "$method" "" "$(mcp_body "$method" '{}')"
+    check "$method: status" "$STATUS" 404
+    check "$method: error code" "$(field .error.code)" -32601
+  done
+  mcp_post 9 "$TARGET" tools/list "" "[$(mcp_body tools/list '{}')]"
+  check "JSON array body: status" "$STATUS" 400
+  check "JSON array body: error code" "$(field .error.code)" -32600
+  end_lane 9
+}
+
+mlane10() {
+  start_lane 10 lane10-methods
+  cmd_boot 10 "$TARGET"
+  local method
+  for method in GET DELETE; do
+    request 10 "$TARGET" "$method" "$MCP_PATH" -H "$(bearer 10)"
+    check "$method: status" "$STATUS" 405
+    check "$method: Allow header" "$(header 10 allow)" POST
+  done
+  end_lane 10
+}
+
+cmd_perf_mcp() {
+  local n=perf rounds=20 i w rest_url trunk_url mcp_url
+  w=$(wdir $n)
+  TRANSCRIPT="$w/perf-mcp.txt"
+  cmd_down $n
+  rm -rf "$w"
+  mkdir -p "$w"
+  cmd_boot $n trunk
+  cmd_boot $n head
+  rest_url="http://127.0.0.1:$(port $n head)$WRITE_PATH"
+  trunk_url="http://127.0.0.1:$(port $n trunk)$WRITE_PATH"
+  mcp_url="http://127.0.0.1:$(port $n head)$MCP_PATH"
+  mcp_headers $n tools/call add_transaction
+  perf_rest() {
+    curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' -X POST -H "$(bearer $n)" \
+      -H 'Content-Type: application/json' --data-binary "$(dinner "$2")" "$1"
+  }
+  perf_mcp() {
+    curl -sS -o "$w/$1.body" -w '%{http_code} %{time_total}\n' -X POST "${MCP_HEADERS[@]}" \
+      --data-binary "$(tool_call_body add_transaction "$(dinner "$1")")" "$mcp_url"
+  }
+  for i in 1 2 3; do
+    perf_rest "$rest_url" "perf-warm-rest-$i" >/dev/null
+    perf_mcp "perf-warm-mcp-$i" >/dev/null
+    perf_rest "$trunk_url" "perf-warm-trunk-$i" >/dev/null
+  done
+  : >"$w/rest.raw"
+  : >"$w/mcp.raw"
+  : >"$w/trunk.raw"
+  : >"$w/mcp.flags"
+  for ((i = 1; i <= rounds; i++)); do
+    perf_rest "$rest_url" "perf-rest-$i" >>"$w/rest.raw"
+    perf_mcp "perf-mcp-$i" >>"$w/mcp.raw"
+    perf_rest "$trunk_url" "perf-trunk-$i" >>"$w/trunk.raw"
+  done
+  for ((i = 1; i <= rounds; i++)); do
+    jq -r '"\(.result.isError) \(.result.structuredContent.created)"' "$w/perf-mcp-$i.body" 2>/dev/null ||
+      echo "not-json -"
+  done >"$w/mcp.flags"
+  local rest_median mcp_median mcp_p95 rest_codes mcp_codes mcp_flags trunk_median result
+  rest_median=$(cut -d' ' -f2 "$w/rest.raw" | median)
+  mcp_median=$(cut -d' ' -f2 "$w/mcp.raw" | median)
+  mcp_p95=$(cut -d' ' -f2 "$w/mcp.raw" | p95)
+  trunk_median=$(cut -d' ' -f2 "$w/trunk.raw" | median)
+  rest_codes=$(cut -d' ' -f1 "$w/rest.raw" | sort -u | paste -sd' ')
+  mcp_codes=$(cut -d' ' -f1 "$w/mcp.raw" | sort -u | paste -sd' ')
+  mcp_flags=$(sort -u "$w/mcp.flags" | paste -sd,)
+  result=$(awk -v r="$rest_median" -v m="$mcp_median" -v p="$mcp_p95" -v rc="$rest_codes" -v mc="$mcp_codes" \
+    -v f="$mcp_flags" \
+    'BEGIN {print (m <= r + 0.020 && p <= 0.300 && rc == "201" && mc == "200" && f == "false true") ? "PASS" : "FAIL"}')
+  {
+    echo "# perf-mcp: POST $WRITE_PATH (REST) and POST $MCP_PATH tools/call add_transaction (MCP) on head,"
+    echo "# the same dinner arguments with a new key each round; trunk REST for reference only"
+    echo "# trunk image $(docker image inspect --format '{{.Id}}' "$TRUNK_IMAGE")"
+    echo "# head image  $(docker image inspect --format '{{.Id}}' "$HEAD_IMAGE")"
+    echo "# 3 warm-up rounds, then $rounds interleaved rounds; seconds from curl time_total"
+    echo "# columns: rest-status rest mcp-status mcp mcp-isError mcp-created trunk-rest-status trunk-rest"
+    paste -d' ' "$w/rest.raw" "$w/mcp.raw" "$w/mcp.flags" "$w/trunk.raw" | nl -w2 -s' ' | sed 's/^/round /'
+    echo "REST median (baseline): $rest_median s"
+    echo "MCP median:             $mcp_median s"
+    echo "MCP p95:                $mcp_p95 s"
+    echo "REST statuses: $rest_codes"
+    echo "MCP statuses:  $mcp_codes; isError created: $mcp_flags"
+    echo "trunk REST median (info): $trunk_median s"
+    echo "RESULT: $result (MCP median <= REST median + 0.020 s; MCP p95 <= 0.300 s; every REST 201; every MCP 200 with created true)"
+  } >"$TRANSCRIPT"
+  cmd_down $n
+  echo "perf-mcp: $result  $TRANSCRIPT"
+}
+
 cmd_images() {
   docker build -q -t "$HEAD_IMAGE" "$REPO" >/dev/null
   git -C "$REPO" archive "$TRUNK_REF" | docker build -q -t "$TRUNK_IMAGE" - >/dev/null
@@ -747,8 +1201,15 @@ write-all)
   for n in 1 2 3 4 5 6 7 8 9 10; do "wlane$n"; done
   cmd_perf_write
   ;;
+mcp-lane) "mlane$2" ;;
+perf-mcp) cmd_perf_mcp ;;
+mcp-all)
+  cmd_images
+  for n in 1 2 3 4 5 6 7 8 9 10; do "mlane$n"; done
+  cmd_perf_mcp
+  ;;
 *)
-  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
   ;;
 esac
