@@ -1,6 +1,7 @@
 # Example. Copy it to compose.yaml next to a `ledger/` folder that holds
 # main.beancount and an `agent-token` file that holds one random line, then run
-# `docker compose up -d`. docs/agent-api.md describes each value.
+# `docker compose up -d`. docs/agent-api.md describes the setup, and
+# docs/agent-api-reference.md lists each variable.
 # The container exits at start unless AGENT_API_TOKEN_FILE or both CF_ACCESS_*
 # variables are set. Every request then needs the agent token or a Cloudflare
 # Access JWT, and the port stays on loopback because the token travels in cleartext.
