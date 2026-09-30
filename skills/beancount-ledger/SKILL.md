@@ -14,7 +14,7 @@ description: 在使用者的 beancount 帳本（fava）記帳與查帳。使用�
 兩條路徑的結果相同。
 
 - 有 MCP tool `list_accounts`、`query`、`add_transaction` 時，用 MCP tool。
-- 沒有這些 tool 時，用 `curl`（8.3 以上）。每個 curl 都以下面這段開頭。curl 自己從環境變數讀取網址與 token，指令中不要寫 `$`，也不要印出 token。
+- 沒有這些 tool 時，用 `curl`（8.3 以上）。每個 curl 都以下面這段開頭。curl 自己從環境變數讀取網址與 token，指令中不要寫 `$`，也不要印出 token。你看不到這兩個環境變數，但它們已經設定好。不要先檢查環境，也不要向使用者要網址或 token，直接執行 curl。只有 curl 回報 `Variable 'BEANCOUNT_...' import fail, not set` 時，才請使用者設定該變數。
 
   ```sh
   curl -sS --variable %BEANCOUNT_FAVA_URL --variable %BEANCOUNT_AGENT_TOKEN --expand-header 'Authorization: Bearer {{BEANCOUNT_AGENT_TOKEN}}'
