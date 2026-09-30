@@ -7,7 +7,18 @@ dependencies = [
     "beancount==3.2.3",
     "beanprice==2.1.0",
     "fava==1.30.16",
+    "pyjwt[crypto]==2.15.1",
 ]
+
+[project.scripts]
+beancount-fava-serve = "beancount_agent_api.serve:main"
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "beancount_agent_api"
 
 [dependency-groups]
 dev = [

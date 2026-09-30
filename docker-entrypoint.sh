@@ -3,7 +3,9 @@
 # it reports `filename: null`, which its own frontend rejects. Fail here instead.
 set -eu
 
-if [ "${1:-}" = "fava" ] && [ -n "${BEANCOUNT_FILE:-}" ]; then
+case "${1:-}" in fava | beancount-fava-serve) checks_ledger=1 ;; *) checks_ledger=0 ;; esac
+
+if [ "$checks_ledger" = 1 ] && [ -n "${BEANCOUNT_FILE:-}" ]; then
   # fava splits BEANCOUNT_FILE on os.pathsep, which is ":" in this image.
   old_ifs=$IFS
   IFS=:

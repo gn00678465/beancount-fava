@@ -11,9 +11,12 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from playwright.sync_api import Browser, Error, expect, sync_playwright
 
 REPO = Path(__file__).resolve().parent.parent
@@ -21,6 +24,8 @@ FIXTURE_LEDGER = REPO / "tests" / "fixtures" / "ledger"
 LEDGER_FILE = "/ledger/main.beancount"
 # publish.yaml reads the versions for its tags from this image after these tests passed.
 IMAGE_TAG = "beancount-fava:test"
+AGENT_TOKEN = "image-test-token"
+ACCESS_AUD = "image-test-aud"
 
 # The image is CPython on Linux. A marker not listed here fails the test, so a
 # new platform-specific dependency gets a decision instead of a silent skip.
@@ -78,21 +83,75 @@ def ledger_volume(image: str) -> Iterator[str]:
         docker("volume", "rm", "-f", name)
 
 
+@dataclass(frozen=True)
+class Access:
+    network: str
+    team_domain: str
+    key: rsa.RSAPrivateKey
+
+    def sign(self) -> str:
+        claims = {"aud": ACCESS_AUD, "iss": self.team_domain, "exp": int(time.time()) + 3600}
+        return jwt.encode(claims, self.key, algorithm="RS256", headers={"kid": "test"})
+
+
+@pytest.fixture(scope="session")
+def access(image: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Access]:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True)
+    srv = tmp_path_factory.mktemp("jwks") / "srv"
+    certs = srv / "cdn-cgi" / "access" / "certs"
+    certs.parent.mkdir(parents=True)
+    certs.write_text(json.dumps({"keys": [{**jwk, "kid": "test", "alg": "RS256"}]}))
+    for path in (srv, srv / "cdn-cgi", certs.parent):
+        path.chmod(0o755)
+    certs.chmod(0o644)
+
+    name = f"bf-jwks-{uuid.uuid4().hex[:12]}"
+    docker("network", "create", name, check=True)
+    try:
+        docker(
+            "create", "--name", name, "--network", name, image,
+            "python", "-u", "-m", "http.server", "8000", "-d", "/tmp/jwks", check=True,
+        )  # fmt: skip
+        docker("cp", f"{srv}/.", f"{name}:/tmp/jwks", check=True)
+        docker("start", name, check=True)
+        deadline = time.monotonic() + 20
+        while "Serving HTTP" not in docker("logs", name).stdout:
+            assert time.monotonic() < deadline, "the JWKS stub did not start"
+            time.sleep(0.2)
+        yield Access(network=name, team_domain=f"http://{name}:8000", key=key)
+    finally:
+        docker("rm", "-f", name)
+        docker("network", "rm", name)
+
+
 @pytest.fixture
-def fava_port(image: str, ledger_volume: str) -> Iterator[tuple[str, int]]:
+def fava_port(
+    image: str, ledger_volume: str, access: Access, tmp_path: Path
+) -> Iterator[tuple[str, int]]:
     """The default command on a random host port; yields (container, port) once fava answers."""
     name = f"bf-fava-{uuid.uuid4().hex[:12]}"
+    token_file = tmp_path / "agent-token"
+    token_file.write_text(f"{AGENT_TOKEN}\n")
+    token_file.chmod(0o644)
     docker(
-        "run", "-d", "--name", name, "-p", "127.0.0.1::5000", "-v", f"{ledger_volume}:/ledger",
-        "-e", f"BEANCOUNT_FILE={LEDGER_FILE}", image, check=True,
+        "create", "--name", name, "-p", "127.0.0.1::5000", "-v", f"{ledger_volume}:/ledger",
+        "--network", access.network, "-e", f"BEANCOUNT_FILE={LEDGER_FILE}",
+        "-e", "AGENT_API_TOKEN_FILE=/run/agent-token",
+        "-e", f"CF_ACCESS_TEAM_DOMAIN={access.team_domain}", "-e", f"CF_ACCESS_AUD={ACCESS_AUD}",
+        image, check=True,
     )  # fmt: skip
     try:
+        docker("cp", str(token_file), f"{name}:/run/agent-token", check=True)
+        docker("start", name, check=True)
         mapping = docker("port", name, "5000/tcp", check=True).stdout
         port = int(mapping.strip().splitlines()[0].rsplit(":", 1)[1])
         deadline = time.monotonic() + 30
         while True:
             try:
                 urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).close()
+                break
+            except urllib.error.HTTPError:
                 break
             except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
                 if time.monotonic() > deadline:
@@ -101,6 +160,17 @@ def fava_port(image: str, ledger_volume: str) -> Iterator[tuple[str, int]]:
         yield name, port
     finally:
         docker("rm", "-f", name)
+
+
+def status(
+    url: str, headers: dict[str, str], method: str = "GET", data: bytes | None = None
+) -> int:
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
 
 
 @pytest.fixture(scope="session")
@@ -147,7 +217,7 @@ def test_python_packages_equal_lock(image: str) -> None:
     result = docker("run", "--rm", image, "/opt/venv/bin/python", "-c", LIST_DISTRIBUTIONS)
     assert result.returncode == 0, result.stderr
     installed = {(_normalize(name), version) for name, version in json.loads(result.stdout)}
-    assert installed == _locked_packages()
+    assert installed == _locked_packages() | {("beancount-fava-image", "0")}
     assert dict(installed)["beancount"].split(".")[0] == "3"
 
     # The base image's own interpreter must not carry packages either.
@@ -179,10 +249,12 @@ def test_runs_as_uid_1000_with_writable_ledger_dir(image: str) -> None:
 
 
 def test_fava_serves_and_writes_the_mounted_ledger(
-    image: str, fava_port: tuple[str, int], ledger_volume: str
+    image: str, fava_port: tuple[str, int], ledger_volume: str, access: Access
 ) -> None:
     _, port = fava_port
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as response:
+    browser_headers = {"Cf-Access-Jwt-Assertion": access.sign()}
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/", headers=browser_headers)
+    with urllib.request.urlopen(request, timeout=5) as response:
         assert response.status == 200
         assert urllib.parse.urlparse(response.url).path.startswith("/spec-ledger/")
 
@@ -200,24 +272,35 @@ def test_fava_serves_and_writes_the_mounted_ledger(
             {"account": "Assets:Cash", "amount": "-50 TWD"},
         ],
     }
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/spec-ledger/api/add_entries",
-        data=json.dumps({"entries": [entry]}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="PUT",
-    )
-    with urllib.request.urlopen(request, timeout=10) as response:
-        assert response.status == 200
+    add_entries = f"http://127.0.0.1:{port}/spec-ledger/api/add_entries"
+    body = json.dumps({"entries": [entry]}).encode()
+    json_headers = {"Content-Type": "application/json"}
+    agent_headers = {"Authorization": f"Bearer {AGENT_TOKEN}"}
+    assert status(add_entries, agent_headers | json_headers, "PUT", body) == 403
+    assert status(add_entries, browser_headers | json_headers, "PUT", body) == 200
 
     stored = docker("run", "--rm", "-v", f"{ledger_volume}:/ledger", image, "cat", LEDGER_FILE)
-    assert "write-probe" in stored.stdout
+    assert stored.stdout.count("write-probe") == 1
+
+
+def test_every_path_needs_a_credential(fava_port: tuple[str, int]) -> None:
+    _, port = fava_port
+    base = f"http://127.0.0.1:{port}"
+    agent_headers = {"Authorization": f"Bearer {AGENT_TOKEN}"}
+    assert status(f"{base}/spec-ledger/api/ledger_data", agent_headers) == 200
+    for path in ("/", "/spec-ledger/api/ledger_data", "/spec-ledger/api/changed", "/static/app.js"):
+        assert status(f"{base}{path}", {}) == 401, path
+    assert status(f"{base}/spec-ledger/income_statement/", agent_headers) == 403
 
 
 def test_ui_opens_navigates_and_adds_an_entry(
-    image: str, fava_port: tuple[str, int], ledger_volume: str, browser: Browser
+    image: str, fava_port: tuple[str, int], ledger_volume: str, browser: Browser, access: Access
 ) -> None:
     _, port = fava_port
-    page = browser.new_context(locale="en-US").new_page()
+    context = browser.new_context(
+        locale="en-US", extra_http_headers={"Cf-Access-Jwt-Assertion": access.sign()}
+    )
+    page = context.new_page()
     problems: list[str] = []
     page.on("pageerror", lambda error: problems.append(f"pageerror: {error}"))
     page.on(
@@ -276,6 +359,18 @@ def test_missing_ledger_file_fails_at_start(image: str) -> None:
         assert "/ledger/missing.beancount" in docker("logs", name).stderr
     finally:
         docker("rm", "-f", name)
+
+
+def test_refuses_to_start_without_credentials(image: str, ledger_volume: str) -> None:
+    result = docker(
+        "run", "--rm", "-v", f"{ledger_volume}:/ledger", "-e", f"BEANCOUNT_FILE={LEDGER_FILE}",
+        image,
+    )  # fmt: skip
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "beancount-fava-serve: no credential is configured: set AGENT_API_TOKEN_FILE for "
+        "agents, or CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD for browsers behind Cloudflare Access"
+    )
 
 
 def test_stops_on_sigterm(fava_port: tuple[str, int]) -> None:

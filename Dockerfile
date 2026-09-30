@@ -10,7 +10,9 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_COMPILE_BYTECODE=1
 WORKDIR /build
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev
+RUN uv sync --locked --no-dev --no-install-project
+COPY src ./src
+RUN uv sync --locked --no-dev --no-editable
 
 FROM base
 # hadolint ignore=DL3008
@@ -30,4 +32,4 @@ USER 1000:1000
 WORKDIR /ledger
 EXPOSE 5000
 ENTRYPOINT ["tini", "--", "docker-entrypoint.sh"]
-CMD ["fava"]
+CMD ["beancount-fava-serve"]
