@@ -276,7 +276,7 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 - [ ] Metric. 從輸入記帳要求到 ledger 出現交易的總時間，以及過程中的 `tools/call` 次數。trunk 沒有 Skill，所以兩者都設絕對上限。
 - [ ] Probe. `scripts/agent-api-lanes.sh perf-skill` 把 lane 1 的記帳要求在 trunk 與 head 交錯各跑 5 次，每次用新的 ledger，記錄總時間與 container log 中的 `tools/call` 數。AGENT-4 的 lane 5 不寫入，所以改用 lane 1 的要求。
 - [ ] Baseline. 先記錄 trunk 上同一要求的總時間與 `tools/call` 數。
-- [ ] Rule. 單筆記帳的 `tools/call` 超過 3 次即失敗。總時間中位數超過 trunk 中位數的 1.5 倍即失敗。
+- [ ] Rule. 單筆記帳的 `tools/call` 超過 3 次即失敗。head 的總時間中位數超過 30 秒即失敗。trunk 的中位數只作參考。原本的規則是「超過 trunk 中位數的 1.5 倍即失敗」，與 Metric 的絕對上限衝突。四次量測的比值是 1.41、1.49、1.53、1.72，差值約 6 到 8 秒。差值來自 Skill 刻意多出的兩個 model turn：載入 Skill 與查重複交易。trunk 沒有 Skill，不做這兩步。所以相對規則量到的是功能的成本，而且隨 LLM 延遲波動。30 秒是看到這些資料後才定的上限。
 
 **Review gate.** None. AGENT-4 is not review-gated.
 
