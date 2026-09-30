@@ -23,6 +23,36 @@ DINNER_ENTRY = (
     "  Expenses:Food:Dinner                                  190 TWD\n"
     "  Assets:TW:Cash                                       -190 TWD\n"
 )
+MCP = "/extension/AgentApi/mcp"
+VERSION = "2026-07-28"
+META = {
+    "io.modelcontextprotocol/protocolVersion": VERSION,
+    "io.modelcontextprotocol/clientCapabilities": {},
+}
+SERVER_META = {
+    "io.modelcontextprotocol/serverInfo": {"name": "beancount-agent-api", "version": "0"}
+}
+BALANCES = "SELECT account, sum(position) GROUP BY account"
+
+
+def rpc(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": {"_meta": META, **(params or {})},
+    }
+
+
+def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return rpc("tools/call", {"name": name, "arguments": arguments})
+
+
+def mcp_headers(body: dict[str, Any]) -> dict[str, str]:
+    headers = {"MCP-Protocol-Version": VERSION, "Mcp-Method": body["method"]}
+    if body["method"] == "tools/call":
+        headers["Mcp-Name"] = body["params"]["name"]
+    return headers
 
 
 @dataclass(frozen=True)
@@ -30,11 +60,17 @@ class Fava:
     container: str
     port: int
 
-    def request(self, method: str, path: str, body: object = None) -> tuple[int, Any]:
+    def request(
+        self, method: str, path: str, body: object = None, headers: dict[str, str] | None = None
+    ) -> tuple[int, Any]:
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}/agent{path}",
             data=None if body is None else json.dumps(body).encode(),
-            headers={"Authorization": f"Bearer {AGENT_TOKEN}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {AGENT_TOKEN}",
+                "Content-Type": "application/json",
+                **(headers or {}),
+            },
             method=method,
         )
         try:
@@ -45,6 +81,10 @@ class Fava:
 
     def add(self, body: object) -> tuple[int, Any]:
         return self.request("POST", "/extension/AgentApi/transactions", body)
+
+    def mcp(self, method: str, params: dict[str, Any] | None = None) -> tuple[int, Any]:
+        body = rpc(method, params)
+        return self.request("POST", MCP, body, mcp_headers(body))
 
     def txns(self) -> str:
         result = docker("exec", self.container, "cat", "/ledger/txns/2026.beancount", check=True)
@@ -151,6 +191,22 @@ def test_concurrent_same_key_writes_once(fava: Fava) -> None:
     assert fava.txns().count("^ik-c1") == 1
 
 
+def test_mcp_over_http(fava: Fava) -> None:
+    original = TXNS.read_text(encoding="utf-8")
+
+    status, body = fava.mcp("server/discover")
+    assert (status, body["result"]["supportedVersions"]) == (200, ["2026-07-28"])
+
+    status, body = fava.mcp("tools/list")
+    names = [tool["name"] for tool in body["result"]["tools"]]
+    assert (status, names) == (200, ["list_accounts", "query", "add_transaction"])
+
+    status, body = fava.mcp("tools/call", {"name": "add_transaction", "arguments": DINNER})
+    assert (status, body["result"]["isError"]) == (200, False)
+    assert body["result"]["structuredContent"]["entry"] == DINNER_ENTRY
+    assert fava.txns() == original + "\n" + DINNER_ENTRY
+
+
 @dataclass(frozen=True)
 class InProcess:
     app: Any
@@ -159,6 +215,24 @@ class InProcess:
     def add(self, body: object) -> tuple[int, Any]:
         response = self.app.test_client().post("/agent/extension/AgentApi/transactions", json=body)
         return response.status_code, response.get_json()
+
+    def get(self, path: str, **query: str) -> Any:
+        return self.app.test_client().get(f"/agent{path}", query_string=query)
+
+    def mcp(self, body: Any, headers: dict[str, str] | None = None, method: str = "POST") -> Any:
+        data = body if isinstance(body, str) else json.dumps(body)
+        return self.app.test_client().open(
+            f"/agent{MCP}",
+            method=method,
+            data=data,
+            content_type="application/json",
+            headers=mcp_headers(body) if headers is None else headers,
+        )
+
+    def result(self, body: dict[str, Any]) -> Any:
+        response = self.mcp(body)
+        assert response.status_code == 200
+        return response.get_json()["result"]
 
 
 @pytest.fixture
@@ -201,3 +275,215 @@ def test_link_on_a_note_is_not_a_transaction(in_process: InProcess) -> None:
         txns.write('\n2026-09-01 note Assets:TW:Cash "wallet" ^ik-d1\n')
 
     assert in_process.add(DINNER)[0] == 201
+
+
+def test_mcp_discover(in_process: InProcess) -> None:
+    assert in_process.result(rpc("server/discover")) == {
+        "supportedVersions": ["2026-07-28"],
+        "capabilities": {"tools": {}},
+        "ttlMs": 3600000,
+        "cacheScope": "private",
+        "resultType": "complete",
+        "_meta": SERVER_META,
+    }
+
+
+def test_mcp_tools_list(in_process: InProcess) -> None:
+    result = in_process.result(rpc("tools/list"))
+    tools = {tool["name"]: tool for tool in result["tools"]}
+    assert list(tools) == ["list_accounts", "query", "add_transaction"]
+    assert (result["resultType"], result["ttlMs"], result["cacheScope"]) == (
+        "complete",
+        3600000,
+        "private",
+    )
+    assert result["_meta"] == SERVER_META
+    assert tools["add_transaction"]["inputSchema"]["required"] == [
+        "source",
+        "target",
+        "amount",
+        "key",
+    ]
+    assert tools["query"]["inputSchema"]["required"] == ["query_string"]
+
+
+def test_mcp_list_accounts_matches_rest(in_process: InProcess) -> None:
+    rest = in_process.get("/api/ledger_data")
+    result = in_process.result(call("list_accounts", {}))
+    assert result["isError"] is False
+    assert result["structuredContent"] == rest.get_json()
+    assert result["content"] == [{"type": "text", "text": rest.get_data(as_text=True)}]
+    assert result["structuredContent"]["data"]["account_details"]["Assets:TW:Cash"]["meta"] == {
+        "filename": str(in_process.txns.parent.parent / "main.beancount"),
+        "lineno": 11,
+        "name-zh": "錢包",
+    }
+
+
+def test_mcp_query_matches_rest(in_process: InProcess) -> None:
+    rest = in_process.get("/api/query", query_string=BALANCES)
+    result = in_process.result(call("query", {"query_string": BALANCES}))
+    assert result["isError"] is False
+    assert result["structuredContent"] == rest.get_json()
+    assert result["content"] == [{"type": "text", "text": rest.get_data(as_text=True)}]
+    assert result["structuredContent"]["data"]["rows"][0] == ["Assets:TW:Cash", {"TWD": 4850}]
+
+    result = in_process.result(call("query", {"query_string": "SELEC"}))
+    assert (result["isError"], result["structuredContent"]) == (
+        True,
+        {"error": "Query parse error: syntax error."},
+    )
+    assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+
+    result = in_process.result(call("query", {}))
+    assert (result["isError"], result["structuredContent"]) == (
+        True,
+        {"error": "Send 'query_string' as a string."},
+    )
+
+
+def test_mcp_add_transaction_writes_the_entry(in_process: InProcess) -> None:
+    original = in_process.txns.read_text(encoding="utf-8")
+
+    result = in_process.result(call("add_transaction", DINNER))
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "created": True,
+        "link": "ik-d1",
+        "entry": DINNER_ENTRY,
+        "errors": {"before": 0, "after": 0},
+    }
+    assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+    assert in_process.txns.read_text(encoding="utf-8") == original + "\n" + DINNER_ENTRY
+
+
+def test_mcp_rejection_is_a_tool_error(in_process: InProcess) -> None:
+    original = in_process.txns.read_text(encoding="utf-8")
+    ambiguous = {**DINNER, "target": "午餐"}
+
+    result = in_process.result(call("add_transaction", ambiguous))
+    assert result["isError"] is True
+    assert result["structuredContent"] == {
+        "error": {
+            "field": "target",
+            "code": "ambiguous_account",
+            "message": "'午餐' matches more than one account; send one of the candidates.",
+            "candidates": ["Expenses:Food:Lunch", "Expenses:Work:Lunch"],
+        }
+    }
+    assert result["structuredContent"] == in_process.add(ambiguous)[1]
+    assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+    assert in_process.txns.read_text(encoding="utf-8") == original
+
+
+def test_mcp_shares_the_key_with_rest(in_process: InProcess) -> None:
+    shared = {**DINNER, "key": "shared"}
+    assert in_process.add(shared)[0] == 201
+
+    result = in_process.result(call("add_transaction", shared))
+    assert result["structuredContent"]["created"] is False
+    assert in_process.txns.read_text(encoding="utf-8").count("^ik-shared") == 1
+
+
+def test_mcp_names_the_supported_version_for_legacy_clients(in_process: InProcess) -> None:
+    response = in_process.mcp(rpc("initialize"))
+    assert (response.status_code, response.get_json()) == (
+        404,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32601,
+                "message": "Method not found: initialize. This server speaks MCP 2026-07-28 only.",
+            },
+        },
+    )
+
+
+def test_mcp_decodes_the_base64_name_sentinel(in_process: InProcess) -> None:
+    body = call("list_accounts", {})
+    headers = {**mcp_headers(body), "Mcp-Name": "=?base64?bGlzdF9hY2NvdW50cw==?="}
+    response = in_process.mcp(body, headers)
+    assert (response.status_code, response.get_json()["result"]["isError"]) == (200, False)
+
+
+LIST_HEADERS = {"MCP-Protocol-Version": VERSION, "Mcp-Method": "tools/list"}
+LEGACY_META = {**META, "io.modelcontextprotocol/protocolVersion": "2025-11-25"}
+LADDER_CASES = [
+    ("POST", rpc("tools/list"), {"Mcp-Method": "tools/list"}, 400, -32020, None),
+    ("POST", rpc("tools/list"), {**LIST_HEADERS, "Mcp-Method": "tools/call"}, 400, -32020, None),
+    (
+        "POST",
+        call("query", {"query_string": BALANCES}),
+        {**LIST_HEADERS, "Mcp-Method": "tools/call", "Mcp-Name": "list_accounts"},
+        400,
+        -32020,
+        None,
+    ),
+    (
+        "POST",
+        {**rpc("tools/list"), "params": {"_meta": LEGACY_META}},
+        {**LIST_HEADERS, "MCP-Protocol-Version": "2025-11-25"},
+        400,
+        -32022,
+        {"supported": ["2026-07-28"], "requested": "2025-11-25"},
+    ),
+    ("POST", {**rpc("tools/list"), "params": {}}, None, 400, -32602, None),
+    ("POST", rpc("initialize"), None, 404, -32601, None),
+    ("POST", rpc("resources/list"), None, 404, -32601, None),
+    ("POST", [rpc("tools/list")], LIST_HEADERS, 400, -32600, None),
+    ("POST", "{not json", LIST_HEADERS, 400, -32700, None),
+    pytest.param("POST", "[" * 1000000, LIST_HEADERS, 400, -32700, None, id="deep-nesting"),
+    ("POST", call("nope", {}), None, 400, -32602, None),
+    ("POST", {"jsonrpc": "2.0", "method": "notifications/initialized"}, {}, 202, None, None),
+    ("GET", rpc("tools/list"), None, 405, None, None),
+    ("DELETE", rpc("tools/list"), None, 405, None, None),
+    ("POST", rpc("tools/list"), {**LIST_HEADERS, "Origin": "http://evil"}, 403, -32600, None),
+]
+
+
+@pytest.mark.parametrize(("method", "body", "headers", "status", "code", "data"), LADDER_CASES)
+def test_mcp_error_ladder(
+    in_process: InProcess,
+    method: str,
+    body: Any,
+    headers: dict[str, str] | None,
+    status: int,
+    code: int | None,
+    data: Any,
+) -> None:
+    response = in_process.mcp(body, headers, method)
+    assert response.status_code == status
+    if code is None:
+        assert response.get_data() == b""
+    else:
+        error = response.get_json()["error"]
+        assert (error["code"], error.get("data")) == (code, data)
+    if status == 405:
+        assert response.headers["Allow"] == "POST"
+
+
+def test_mcp_malformed_mcp_name_is_a_header_mismatch(in_process: InProcess) -> None:
+    body = rpc("tools/call", {"arguments": {}})
+    headers = {**LIST_HEADERS, "Mcp-Method": "tools/call"}
+    for name in ("=?base64?!!?=", "=?base64?bGlzdF9hY2NvdW50cx==?=", "é"):
+        response = in_process.mcp(body, {**headers, "Mcp-Name": name})
+        assert (response.status_code, response.get_json()["error"]["code"]) == (400, -32020)
+
+
+def test_mcp_error_echoes_a_readable_id(in_process: InProcess) -> None:
+    response = in_process.mcp({**rpc("tools/list"), "id": 7, "params": None}, LIST_HEADERS)
+    assert (response.status_code, response.get_json()["id"]) == (400, 7)
+
+
+def test_mcp_echoes_a_lone_surrogate_id(in_process: InProcess) -> None:
+    response = in_process.mcp(json.dumps({**rpc("tools/list"), "id": "\ud800"}), LIST_HEADERS)
+    assert (response.status_code, response.get_json()["id"]) == (200, "\ud800")
+
+
+def test_mcp_log_names_only_known_methods(in_process: InProcess, capsys: Any) -> None:
+    forged = "tools/list\nmcp tools/call add_transaction 200"
+    in_process.mcp({**rpc("tools/list"), "method": forged}, LIST_HEADERS)
+    in_process.mcp({"jsonrpc": "2.0", "method": forged}, {})
+    in_process.result(rpc("tools/list"))
+    assert capsys.readouterr().err == "mcp - - 404 -32601\nmcp - - 202\nmcp tools/list - 200\n"

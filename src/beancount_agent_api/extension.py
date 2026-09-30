@@ -9,6 +9,7 @@ from beancount.core.data import Directive, Transaction
 from fava.ext import FavaExtensionBase, extension_endpoint
 from flask import Response, jsonify, request
 
+from beancount_agent_api import mcp
 from beancount_agent_api.core import (
     Accounts,
     Rejection,
@@ -37,15 +38,22 @@ class AgentApi(FavaExtensionBase):
 
     @extension_endpoint("transactions", ["POST"])
     def transactions(self) -> Response:
+        return self.add(request.get_json(silent=True))
+
+    @extension_endpoint("mcp", ["GET", "POST", "PUT", "DELETE"])
+    def mcp_endpoint(self) -> Response:
+        return mcp.handle(self)
+
+    def add(self, raw: object) -> Response:
         if not _write_lock.acquire(timeout=LOCK_TIMEOUT):
             busy = Rejection("", "busy", "Another write is still running; retry with the same key.")
             return _error(busy, 503)
         try:
-            return self._add()
+            return self._add(raw)
         finally:
             _write_lock.release()
 
-    def _add(self) -> Response:
+    def _add(self, raw: object) -> Response:
         ledger = self.ledger
         ledger.changed()
         accounts = Accounts.from_directives(
@@ -54,7 +62,7 @@ class AgentApi(FavaExtensionBase):
             ledger.options["operating_currency"],
         )
         today = datetime.datetime.now(TZ).date()
-        req = parse_add_request(request.get_json(silent=True), accounts, TZ, today)
+        req = parse_add_request(raw, accounts, TZ, today)
         if isinstance(req, Rejection):
             return _error(req, 422)
         txn = build_transaction(req)
