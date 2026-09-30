@@ -1,0 +1,7 @@
+2026-01-01 * "Opening balance"
+  Assets:TW:Cash                                       5000 TWD
+  Equity:Opening-Balances
+
+2026-09-20 * "Noodle shop" "dinner"
+  Expenses:Food:Dinner                                  150 TWD
+  Assets:TW:Cash
