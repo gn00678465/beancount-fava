@@ -41,7 +41,7 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
   - [ ] AGENT-2 在 AGENT-1 之後，base 是 AGENT-1 的 head。
   - [ ] AGENT-3 在 AGENT-2 之後，base 是 AGENT-2 的 head。
   - [ ] AGENT-4 在 AGENT-3 之後，base 是 AGENT-3 的 head。
-- [ ] 守住檔案邊界。AGENT-1 只改 `src/beancount_agent_api/{__init__,guard,serve}.py`、`pyproject.toml`、`uv.lock`、`Dockerfile`、`.dockerignore`、`docker-entrypoint.sh`、`tests/**`、`scripts/agent-api-lanes.sh`。AGENT-2 只改 `src/beancount_agent_api/{__init__,core,extension}.py`、`tests/**`、`scripts/agent-api-lanes.sh`。AGENT-3 只改 `src/beancount_agent_api/{extension,mcp}.py`、`tests/**`、`scripts/agent-api-lanes.sh`。AGENT-4 只改 `skills/**`、`docs/**`、`compose.example.yaml`。
+- [ ] 守住檔案邊界。AGENT-1 只改 `src/beancount_agent_api/{__init__,guard,serve}.py`、`pyproject.toml`、`uv.lock`、`Dockerfile`、`.dockerignore`、`docker-entrypoint.sh`、`tests/**`、`scripts/agent-api-lanes.sh`。AGENT-2 只改 `src/beancount_agent_api/{__init__,core,extension}.py`、`tests/**`、`scripts/agent-api-lanes.sh`。AGENT-3 只改 `src/beancount_agent_api/{extension,mcp}.py`、`tests/**`、`scripts/agent-api-lanes.sh`。AGENT-4 只改 `skills/**`、`docs/**`、`compose.example.yaml`，以及 Verify 方塊需要的 `tests/test_image.py` 與 `scripts/agent-api-lanes.sh`。
 - [ ] 守住審查關卡。四個單元都不改使用者介面的操作方式，沒有 review gate。使用者在合併前審查整個 PR。
 
 ### PR mechanics, for every PR
@@ -274,7 +274,7 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 **Verify, perf.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked.
 
 - [ ] Metric. 從輸入記帳要求到 ledger 出現交易的總時間，以及過程中的 `tools/call` 次數。trunk 沒有 Skill，所以兩者都設絕對上限。
-- [ ] Probe. lane 5 的 `claude -p` 流程重跑 5 次，記錄總時間與 container log 中的 `tools/call` 數。
+- [ ] Probe. `scripts/agent-api-lanes.sh perf-skill` 把 lane 1 的記帳要求在 trunk 與 head 交錯各跑 5 次，每次用新的 ledger，記錄總時間與 container log 中的 `tools/call` 數。AGENT-4 的 lane 5 不寫入，所以改用 lane 1 的要求。
 - [ ] Baseline. 先記錄 trunk 上同一要求的總時間與 `tools/call` 數。
 - [ ] Rule. 單筆記帳的 `tools/call` 超過 3 次即失敗。總時間中位數超過 trunk 中位數的 1.5 倍即失敗。
 
@@ -335,6 +335,11 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 - **冪等只在單一 fava process 內成立。** 鎖是 process 內的 `threading.Lock`，fava 以單一 process 執行時成立。落在 AGENT-2，由 lane 8 的並行測試驗證。
 - **寫入後帳本錯誤。** fava `insert_entries` 寫檔前不驗證整本帳。AGENT-2 在寫入前檢查帳戶的開帳日與關帳日，寫入後回報 errors 數量的差，不做自動回滾。
 - **跨年。** `default-file` 固定指向 `txns/2026.beancount`，2027 年要由使用者更新。寫進 `docs/agent-api.md`。
+- **以 `fava` 覆寫 CMD 會略過 guard。** `docker-entrypoint.sh` 接受 `fava` 指令，這時 fava 沒有 guard，任何人都能讀寫。依決定不阻擋。落在 AGENT-1，寫進 `docs/agent-api.md`。
+- **偽造 JWT 的 `kid` 會觸發 JWKS 重新下載。** `kid` 不在快取中時，`PyJWKClient` 重新下載公鑰，每次最多等 2 秒，可能佔住 fava 的 worker。這是由程式碼推論，沒有量測。本分支沒有修正。落在 AGENT-1，寫進 `docs/agent-api.md`。
+- **沒有請求 body 的大小上限。** guard 先檢查憑證，所以只有持有 token 或有效 JWT 的人能送出大 body。落在 AGENT-2，寫進 `docs/agent-api.md`。
+- **key 與 narration 沒有長度上限，narration 接受 `Cf` 字元。** 例如 U+202E 會讓顯示順序與實際文字不同。使用者核准前要仔細讀 narration。落在 AGENT-2，寫進 `docs/agent-api.md`。
+- **MCP 的 `query` 不套用 fava 的篩選條件與時間範圍。** 條件要寫在 BQL 的 `WHERE`。落在 AGENT-3，寫進 `docs/agent-api.md`。
 
 ## Appendix D. Links and reading list
 
