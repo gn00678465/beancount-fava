@@ -1,0 +1,22 @@
+option "title" "Agent"
+option "operating_currency" "TWD"
+
+2020-01-01 custom "fava-extension" "beancount_agent_api"
+2020-01-01 custom "fava-option" "currency-column" "61"
+2020-01-01 custom "fava-option" "indent" "2"
+2020-01-01 custom "fava-option" "default-file" "txns/2026.beancount"
+
+include "txns/2026.beancount"
+
+2026-01-01 open Assets:TW:Cash TWD
+  name-zh: "錢包"
+2026-01-01 open Assets:TW:EasyCard TWD
+  name-zh: "悠遊卡"
+2026-06-30 close Assets:TW:EasyCard
+2026-01-01 open Expenses:Food:Dinner TWD
+  name-zh: "食物/晚餐"
+2026-01-01 open Expenses:Food:Lunch TWD
+  name-zh: "食物/午餐"
+2026-01-01 open Expenses:Work:Lunch TWD
+  name-zh: "公務/午餐"
+2026-01-01 open Equity:Opening-Balances TWD

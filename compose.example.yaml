@@ -1,15 +1,24 @@
 # Example. Copy it to compose.yaml next to a `ledger/` folder that holds
-# main.beancount, then run `docker compose up -d` and open http://127.0.0.1:5000.
-# fava has no authentication, so the port is bound to loopback only.
+# main.beancount and an `agent-token` file that holds one random line, then run
+# `docker compose up -d`. docs/agent-api.md describes each value.
+# The container exits at start unless AGENT_API_TOKEN_FILE or both CF_ACCESS_*
+# variables are set. Every request then needs the agent token or a Cloudflare
+# Access JWT, and the port stays on loopback because the token travels in cleartext.
 services:
   fava:
     image: gn00678465/beancount-fava:1.30.16-beancount3.2.3@sha256:8f6268925beedba99bf425ead452a23e444175a73e6c54398df904228dc8c585
+    # The image runs as uid 1000. That uid must write the ledger files, or fava cannot save
+    # edits, and read agent-token. On Unraid, where appdata belongs to 99:100 (nobody:users),
+    # uncomment the next line and give uid 99 that access.
+    # user: "99:100"
     environment:
       BEANCOUNT_FILE: /ledger/main.beancount
+      AGENT_API_TOKEN_FILE: /run/secrets/agent-token
+      CF_ACCESS_TEAM_DOMAIN: https://<team>.cloudflareaccess.com
+      CF_ACCESS_AUD: <application-audience-tag>
     volumes:
-      # The image runs as uid 1000; fava can save edits only when that uid can
-      # write the ledger files.
       - ./ledger:/ledger
+      - ./agent-token:/run/secrets/agent-token:ro
     ports:
       - "127.0.0.1:5000:5000"
     restart: unless-stopped
