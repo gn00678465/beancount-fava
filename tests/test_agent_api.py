@@ -15,6 +15,8 @@ from conftest import AGENT_TOKEN, REPO, docker, ledger_volume_of, running_fava
 from fava.application import create_app
 from fava.core import FavaLedger
 
+from beancount_agent_api.core import FIELDS
+
 AGENT_LEDGER = REPO / "tests" / "fixtures" / "agent-ledger"
 TXNS = AGENT_LEDGER / "txns" / "2026.beancount"
 DINNER = {"date": "2026-09-24", "source": "錢包", "target": "晚餐", "amount": "190", "key": "d1"}
@@ -426,6 +428,24 @@ def test_mcp_add_transaction_writes_the_entry(in_process: InProcess) -> None:
     }
     assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
     assert in_process.txns.read_text(encoding="utf-8") == original + "\n" + DINNER_ENTRY
+
+
+def test_mcp_add_transaction_with_payee_tags_meta(in_process: InProcess) -> None:
+    result = in_process.result(call("add_transaction", REPAID))
+    assert (result["isError"], result["structuredContent"]) == (
+        False,
+        {
+            "created": True,
+            "link": "ik-r1",
+            "entry": REPAID_ENTRY,
+            "errors": {"before": 0, "after": 0},
+        },
+    )
+
+
+def test_mcp_schema_lists_every_request_field(in_process: InProcess) -> None:
+    tools = {tool["name"]: tool for tool in in_process.result(rpc("tools/list"))["tools"]}
+    assert set(tools["add_transaction"]["inputSchema"]["properties"]) == set(FIELDS)
 
 
 def test_mcp_rejection_is_a_tool_error(in_process: InProcess) -> None:
