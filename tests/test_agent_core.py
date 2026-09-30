@@ -55,6 +55,9 @@ def test_dinner_resolves_aliases(accounts: Accounts) -> None:
         amount=Decimal(190),
         currency="TWD",
         narration="",
+        payee=None,
+        tags=frozenset(),
+        meta=(),
         key="d1",
         dry_run=False,
     )
@@ -211,7 +214,7 @@ def test_key_charset(accounts: Accounts) -> None:
     assert result.link == "ik-a/b.c-d_e"
 
 
-@pytest.mark.parametrize("field", ["postings", "price", "cost", "flag", "links", "meta"])
+@pytest.mark.parametrize("field", ["postings", "price", "cost", "flag", "links"])
 def test_client_cannot_send_entry_syntax(accounts: Accounts, field: str) -> None:
     assert code(parse(accounts, **{field: "x"})) == (field, "unknown_field")
 
@@ -280,3 +283,121 @@ def test_last_accepted_date(accounts: Accounts) -> None:
     result = parse(accounts, date="2027-10-01")
     assert isinstance(result, AddRequest), result
     assert result.date == datetime.date(2027, 10, 1)
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        ({"payee": 1}, Rejection("payee", "invalid_type", "Send 'payee' as a JSON string.")),
+        (
+            {"tags": "reimburse"},
+            Rejection("tags", "invalid_type", "Send 'tags' as a JSON array of strings."),
+        ),
+        (
+            {"tags": ["reimburse", 1]},
+            Rejection("tags", "invalid_type", "Send 'tags' as a JSON array of strings."),
+        ),
+        (
+            {"meta": [["note", "還代墊"]]},
+            Rejection("meta", "invalid_type", "Send 'meta' as a JSON object with string values."),
+        ),
+        (
+            {"meta": {"amount": 190}},
+            Rejection("meta", "invalid_type", "Send 'meta' as a JSON object with string values."),
+        ),
+        (
+            {"payee": "小明\n"},
+            Rejection(
+                "payee",
+                "invalid_payee",
+                "Remove line breaks and control characters from 'payee'.",
+            ),
+        ),
+        (
+            {"tags": ["ok", "還代墊"]},
+            Rejection(
+                "tags",
+                "invalid_tag",
+                "Tag '還代墊' may use only ASCII letters, digits, and - _ / .; "
+                "put other text in 'meta'.",
+            ),
+        ),
+        (
+            {"meta": {"Note": "還代墊"}},
+            Rejection(
+                "meta",
+                "invalid_meta_key",
+                "Meta key 'Note' must start with a lowercase ASCII letter, "
+                "followed by ASCII letters, digits, - or _.",
+            ),
+        ),
+        (
+            {"meta": {"time": "07:00:00"}},
+            Rejection("meta", "reserved_meta_key", "Remove 'time' from 'meta'; the API sets it."),
+        ),
+        (
+            {"meta": {"note": "還\t代墊"}},
+            Rejection(
+                "meta",
+                "invalid_meta_value",
+                "Remove line breaks and control characters from meta 'note'.",
+            ),
+        ),
+    ],
+)
+def test_payee_tags_meta_rejections(
+    accounts: Accounts, changes: dict[str, object], expected: Rejection
+) -> None:
+    assert parse(accounts, **changes) == expected
+
+
+@pytest.mark.parametrize("tag", ["a:b", "a+b", "é", "a b", ""])
+def test_tag_charset(accounts: Accounts, tag: str) -> None:
+    assert code(parse(accounts, tags=[tag])) == ("tags", "invalid_tag")
+
+
+@pytest.mark.parametrize("key", ["1a", "中", "_a", "a.b", "a:b", ""])
+def test_meta_key_charset(accounts: Accounts, key: str) -> None:
+    assert code(parse(accounts, meta={key: "x"})) == ("meta", "invalid_meta_key")
+
+
+@pytest.mark.parametrize("key", ["time", "filename", "lineno"])
+def test_reserved_meta_keys(accounts: Accounts, key: str) -> None:
+    assert code(parse(accounts, meta={key: "x"})) == ("meta", "reserved_meta_key")
+
+
+def test_tags_collapse_and_empty_payee_is_none(accounts: Accounts) -> None:
+    result = parse(accounts, payee="", tags=["b", "a/b.c-d_e", "b"], meta={"n-1": "x"})
+    assert isinstance(result, AddRequest), result
+    assert (result.payee, result.tags, result.meta) == (
+        None,
+        frozenset({"b", "a/b.c-d_e"}),
+        (("n-1", "x"),),
+    )
+
+
+def test_render_payee_tags_meta_in_one_order(accounts: Accounts) -> None:
+    common = {
+        "date": None,
+        "time": "2026-09-25T07:00:00+08:00",
+        "narration": "手機",
+        "payee": "小明",
+    }
+    first = parse(
+        accounts, **common, tags=["reimburse", "family"], meta={"zone": "台北", "note": "還代墊"}
+    )
+    second = parse(
+        accounts, **common, tags=["family", "reimburse"], meta={"note": "還代墊", "zone": "台北"}
+    )
+    assert isinstance(first, AddRequest), first
+    assert isinstance(second, AddRequest), second
+    expected = (
+        '2026-09-25 ! "小明" "手機" #family #reimburse ^ik-d1\n'
+        '  note: "還代墊"\n'
+        '  time: "07:00:00"\n'
+        '  zone: "台北"\n'
+        "  Expenses:Food:Dinner                                  190 TWD\n"
+        "  Assets:TW:Cash                                       -190 TWD\n"
+    )
+    assert to_string(build_transaction(first), 61, 2) == expected
+    assert to_string(build_transaction(second), 61, 2) == expected

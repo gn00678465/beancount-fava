@@ -15,6 +15,8 @@ from conftest import AGENT_TOKEN, REPO, docker, ledger_volume_of, running_fava
 from fava.application import create_app
 from fava.core import FavaLedger
 
+from beancount_agent_api.core import FIELDS
+
 AGENT_LEDGER = REPO / "tests" / "fixtures" / "agent-ledger"
 TXNS = AGENT_LEDGER / "txns" / "2026.beancount"
 DINNER = {"date": "2026-09-24", "source": "錢包", "target": "晚餐", "amount": "190", "key": "d1"}
@@ -213,7 +215,12 @@ class InProcess:
     txns: Path
 
     def add(self, body: object) -> tuple[int, Any]:
-        response = self.app.test_client().post("/agent/extension/AgentApi/transactions", json=body)
+        # Flask's json= sorts object keys; a real client keeps its own key order.
+        response = self.app.test_client().post(
+            "/agent/extension/AgentApi/transactions",
+            data=json.dumps(body),
+            content_type="application/json",
+        )
         return response.status_code, response.get_json()
 
     def get(self, path: str, **query: str) -> Any:
@@ -268,6 +275,72 @@ def test_retry_after_the_entry_was_approved(in_process: InProcess) -> None:
 
     status, body = in_process.add(DINNER)
     assert (status, body["entry"]) == (200, DINNER_ENTRY.replace(" ! ", " * "))
+
+
+REPAID = {
+    **DINNER,
+    "narration": "手機",
+    "payee": "小明",
+    "tags": ["reimburse", "family"],
+    "meta": {"via": "line-pay", "note": "還代墊"},
+    "key": "r1",
+}
+REPAID_ENTRY = (
+    '2026-09-24 ! "小明" "手機" #family #reimburse ^ik-r1\n'
+    '  note: "還代墊"\n'
+    '  via: "line-pay"\n'
+    "  Expenses:Food:Dinner                                  190 TWD\n"
+    "  Assets:TW:Cash                                       -190 TWD\n"
+)
+
+
+def test_payee_tags_and_meta_retry_in_any_order(in_process: InProcess) -> None:
+    original = in_process.txns.read_text(encoding="utf-8")
+    assert in_process.add(REPAID) == (
+        201,
+        {
+            "created": True,
+            "link": "ik-r1",
+            "entry": REPAID_ENTRY,
+            "errors": {"before": 0, "after": 0},
+        },
+    )
+    assert in_process.txns.read_text(encoding="utf-8") == original + "\n" + REPAID_ENTRY
+
+    # A new app has only the file, so the retry compares against the parsed entry.
+    ledger = in_process.txns.parent.parent / "main.beancount"
+    restarted = InProcess(create_app([str(ledger)], poll_watcher=True), in_process.txns)
+    reordered = {
+        **REPAID,
+        "tags": ["family", "reimburse", "family"],
+        "meta": {"note": "還代墊", "via": "line-pay"},
+    }
+    assert restarted.add(reordered) == (
+        200,
+        {"created": False, "link": "ik-r1", "entry": REPAID_ENTRY},
+    )
+
+    status, body = restarted.add({**REPAID, "tags": ["reimburse"]})
+    assert (status, body["error"]["code"], body["entry"]) == (409, "key_conflict", REPAID_ENTRY)
+    assert in_process.txns.read_text(encoding="utf-8").count("^ik-r1") == 1
+
+
+def test_meta_and_time_share_one_order(in_process: InProcess) -> None:
+    timed = {k: v for k, v in REPAID.items() if k != "date"}
+    status, body = in_process.add(
+        {**timed, "time": "2026-09-24T23:00:00Z", "tags": [], "key": "r2"}
+    )
+    assert (status, body["entry"]) == (
+        201,
+        (
+            '2026-09-25 ! "小明" "手機" ^ik-r2\n'
+            '  note: "還代墊"\n'
+            '  time: "07:00:00"\n'
+            '  via: "line-pay"\n'
+            "  Expenses:Food:Dinner                                  190 TWD\n"
+            "  Assets:TW:Cash                                       -190 TWD\n"
+        ),
+    )
 
 
 def test_link_on_a_note_is_not_a_transaction(in_process: InProcess) -> None:
@@ -355,6 +428,24 @@ def test_mcp_add_transaction_writes_the_entry(in_process: InProcess) -> None:
     }
     assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
     assert in_process.txns.read_text(encoding="utf-8") == original + "\n" + DINNER_ENTRY
+
+
+def test_mcp_add_transaction_with_payee_tags_meta(in_process: InProcess) -> None:
+    result = in_process.result(call("add_transaction", REPAID))
+    assert (result["isError"], result["structuredContent"]) == (
+        False,
+        {
+            "created": True,
+            "link": "ik-r1",
+            "entry": REPAID_ENTRY,
+            "errors": {"before": 0, "after": 0},
+        },
+    )
+
+
+def test_mcp_schema_lists_every_request_field(in_process: InProcess) -> None:
+    tools = {tool["name"]: tool for tool in in_process.result(rpc("tools/list"))["tools"]}
+    assert set(tools["add_transaction"]["inputSchema"]["properties"]) == set(FIELDS)
 
 
 def test_mcp_rejection_is_a_tool_error(in_process: InProcess) -> None:

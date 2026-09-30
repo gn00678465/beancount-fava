@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 import re
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -69,6 +69,9 @@ class AddRequest:
     amount: Decimal
     currency: str
     narration: str
+    payee: str | None
+    tags: frozenset[str]
+    meta: tuple[tuple[str, str], ...]
     key: str
     dry_run: bool
 
@@ -85,7 +88,38 @@ class Rejection:
     candidates: tuple[str, ...] = ()
 
 
-FIELDS = ("date", "time", "source", "target", "amount", "currency", "narration", "key", "dry_run")
+def _is_string(value: object) -> bool:
+    return isinstance(value, str)
+
+
+def _is_string_array(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _is_string_object(value: object) -> bool:
+    return isinstance(value, dict) and all(isinstance(item, str) for item in value.values())
+
+
+def _is_boolean(value: object) -> bool:
+    return isinstance(value, bool)
+
+
+# Each request field with its JSON type check and the type name that a rejection shows.
+FIELD_TYPES: Mapping[str, tuple[Callable[[object], bool], str]] = {
+    "date": (_is_string, "string"),
+    "time": (_is_string, "string"),
+    "source": (_is_string, "string"),
+    "target": (_is_string, "string"),
+    "amount": (_is_string, "string"),
+    "currency": (_is_string, "string"),
+    "narration": (_is_string, "string"),
+    "payee": (_is_string, "string"),
+    "tags": (_is_string_array, "array of strings"),
+    "meta": (_is_string_object, "object with string values"),
+    "key": (_is_string, "string"),
+    "dry_run": (_is_boolean, "boolean"),
+}
+FIELDS = tuple(FIELD_TYPES)
 REQUIRED = ("source", "target", "amount", "key")
 # The link charset of beancount's lexer (lexer.l).
 KEY_RE = re.compile(r"[A-Za-z0-9\-_/.]+")
@@ -102,6 +136,10 @@ CURRENCY_RE = re.compile(beancount_amount.CURRENCY_RE)
 # narration; fava's align then rewrites it, and a `\r` becomes `\n` on fava's next file rewrite.
 # A lone surrogate fails UTF-8 encoding after fava has truncated the file for its rewrite.
 NARRATION_FORBIDDEN = frozenset({"Cc", "Cs", "Zl", "Zp"})
+# The metadata key charset of beancount's lexer (lexer.l).
+META_KEY_RE = re.compile(r"[a-z][a-zA-Z0-9\-_]*")
+# The API writes `time` from the 'time' field, and beancount sets filename and lineno on load.
+RESERVED_META_KEYS = frozenset({"time", "filename", "lineno"})
 # fava's reports compute date + 1 day, so an entry on date.max breaks them for every user.
 MAX_DAYS_AHEAD = 366
 
@@ -123,8 +161,8 @@ def parse_add_request(
                 f"Remove {field!r}; accepted fields are {', '.join(FIELDS)}.",
             )
     for field, value in raw.items():
-        expected, json_type = (bool, "boolean") if field == "dry_run" else (str, "string")
-        if not isinstance(value, expected):
+        is_type, json_type = FIELD_TYPES[field]
+        if not is_type(value):
             return Rejection(field, "invalid_type", f"Send {field!r} as a JSON {json_type}.")
     for field in REQUIRED:
         if field not in raw:
@@ -189,12 +227,48 @@ def parse_add_request(
         )
 
     narration = raw.get("narration", "")
-    if any(unicodedata.category(char) in NARRATION_FORBIDDEN for char in narration):
+    if not _is_one_line(narration):
         return Rejection(
             "narration",
             "invalid_narration",
             "Remove line breaks and control characters from 'narration'.",
         )
+
+    payee = raw.get("payee", "")
+    if not _is_one_line(payee):
+        return Rejection(
+            "payee", "invalid_payee", "Remove line breaks and control characters from 'payee'."
+        )
+
+    tags = frozenset(raw.get("tags", []))
+    for tag in sorted(tags):
+        if KEY_RE.fullmatch(tag) is None:
+            return Rejection(
+                "tags",
+                "invalid_tag",
+                f"Tag {tag!r} may use only ASCII letters, digits, and - _ / .; "
+                "put other text in 'meta'.",
+            )
+
+    meta = tuple(sorted(raw.get("meta", {}).items()))
+    for meta_key, meta_value in meta:
+        if META_KEY_RE.fullmatch(meta_key) is None:
+            return Rejection(
+                "meta",
+                "invalid_meta_key",
+                f"Meta key {meta_key!r} must start with a lowercase ASCII letter, "
+                "followed by ASCII letters, digits, - or _.",
+            )
+        if meta_key in RESERVED_META_KEYS:
+            return Rejection(
+                "meta", "reserved_meta_key", f"Remove {meta_key!r} from 'meta'; the API sets it."
+            )
+        if not _is_one_line(meta_value):
+            return Rejection(
+                "meta",
+                "invalid_meta_value",
+                f"Remove line breaks and control characters from meta {meta_key!r}.",
+            )
 
     resolved = []
     for field in ("source", "target"):
@@ -224,9 +298,16 @@ def parse_add_request(
         amount=amount,
         currency=currency,
         narration=narration,
+        payee=payee or None,
+        tags=tags,
+        meta=meta,
         key=key,
         dry_run=raw.get("dry_run", False),
     )
+
+
+def _is_one_line(text: str) -> bool:
+    return not any(unicodedata.category(char) in NARRATION_FORBIDDEN for char in text)
 
 
 def _resolve(field: str, text: str, date: datetime.date, accounts: Accounts) -> Account | Rejection:
@@ -263,13 +344,18 @@ def _resolve(field: str, text: str, date: datetime.date, accounts: Accounts) -> 
 
 
 def build_transaction(req: AddRequest) -> Transaction:
+    meta = dict(req.meta)
+    if req.time is not None:
+        meta["time"] = req.time
     return create.transaction(
-        meta={"time": req.time} if req.time is not None else {},
+        # fava prints metadata in insertion order and the key check compares printed entries,
+        # so the keys go in one fixed order.
+        meta=dict(sorted(meta.items())),
         date=req.date,
         flag="!",
-        payee=None,
+        payee=req.payee,
         narration=req.narration,
-        tags=frozenset(),
+        tags=req.tags,
         links=frozenset({req.link}),
         postings=[
             create.posting(req.target, create.amount(req.amount, req.currency)),

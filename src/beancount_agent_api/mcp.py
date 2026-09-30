@@ -148,6 +148,23 @@ TOOLS = (
                     "Currency code such as TWD; defaults to the ledger's operating currency."
                 ),
                 "narration": _string("Free text without line breaks or control characters."),
+                "payee": _string(
+                    "Who the transaction is with, such as the person repaid; same rules as "
+                    "narration."
+                ),
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tags, each of ASCII letters, digits, and - _ / . only; "
+                    "put other text in meta.",
+                },
+                "meta": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Metadata such as a reconciliation note. Each key starts "
+                    "with a lowercase ASCII letter, followed by ASCII letters, digits, - or _; "
+                    "time, filename, and lineno are reserved. Values follow the narration rules.",
+                },
                 "key": _string(
                     "Idempotency key: generate one per transaction and reuse it on retry, so "
                     "a retry never writes twice. ASCII letters, digits, and - _ / . only."
