@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Live lanes and perf probes for docs/plans/agent-write-api.md (AGENT-1 guard, AGENT-2 writes, AGENT-3 MCP).
+# Live lanes and perf probes for docs/plans/agent-write-api.md (AGENT-1 guard, AGENT-2 writes, AGENT-3 MCP,
+# AGENT-4 Skill and deploy docs).
 #
 #   images               build $HEAD_IMAGE from this checkout and $TRUNK_IMAGE from $TRUNK_REF
 #   boot <n> [target]    start a JWKS stub and fava for worker <n>; target is head or trunk
@@ -14,7 +15,12 @@
 #   mcp-lane <n>         run MCP lane <n> against $TARGET (head by default); lane 1 boots trunk and head
 #   perf-mcp             interleave head REST and MCP writes, 20 rounds each, plus trunk REST for reference
 #   mcp-all              images, MCP lanes 1-10, perf-mcp
+#   skill-lane <n>       run Skill lane <n> against $TARGET (head by default); lane 1 boots trunk and head;
+#                        lanes 9 and 10 deploy $HEAD_IMAGE from docs/agent-api.md and compose.example.yaml
+#   perf-skill           interleave trunk and head claude -p bookings on a fresh ledger, 5 rounds each
+#   skill-all            images, Skill lanes 1-10, perf-skill
 #
+# boot appends $LEDGER_EXTRA, when set, to the copied main.beancount.
 # Container and network names start with $LANES_PREFIX (default lanes).
 # Transcripts land in $LANES_OUT/worker-<n>/<slug>.txt (trunk runs: trunk-<slug>.txt).
 set -euo pipefail
@@ -93,17 +99,20 @@ print(jwt.encode(payload, open(f"/keys/{key}.pem").read(), algorithm="RS256", he
 PY
 }
 
-wait_ready() {
-  local n=$1 target=$2 deadline=$((SECONDS + 60))
-  until curl -fsS -o /dev/null -H "Authorization: Bearer $(token "$n")" \
-    "http://127.0.0.1:$(port "$n" "$target")/$BFILE/api/errors" 2>/dev/null; do
+wait_url() {
+  local container=$1 url=$2 auth=$3 deadline=$((SECONDS + 60))
+  until curl -fsS -o /dev/null -H "$auth" "$url" 2>/dev/null; do
     if ((SECONDS > deadline)); then
-      docker logs "$(fava "$n" "$target")" >&2
-      echo "fava for worker $n ($target) did not answer within 60s" >&2
+      docker logs "$container" >&2
+      echo "$url did not answer within 60s" >&2
       return 1
     fi
     sleep 0.5
   done
+}
+
+wait_ready() {
+  wait_url "$(fava "$1" "$2")" "http://127.0.0.1:$(port "$1" "$2")/$BFILE/api/errors" "$(bearer "$1")"
 }
 
 ensure_stub() {
@@ -135,6 +144,7 @@ cmd_boot() {
   rm -rf "$d"
   mkdir -p "$d"
   cp -r "$REPO/tests/fixtures/agent-ledger" "$d/ledger"
+  [ -z "${LEDGER_EXTRA:-}" ] || echo "$LEDGER_EXTRA" >>"$d/ledger/main.beancount"
   docker run -d --name "$(fava "$n" "$target")" --network "$(net "$n")" -p 127.0.0.1::5000 \
     -v "$d/ledger:/ledger" -v "$(wdir "$n")/token:/run/agent-token:ro" \
     -e BEANCOUNT_FILE=/ledger/main.beancount -e AGENT_API_TOKEN_FILE=/run/agent-token \
@@ -455,6 +465,16 @@ tree_sha() {
 }
 
 link_count() { grep -rhoE -- "\\^$3([^A-Za-z0-9_/.-]|\$)" "$(idir "$1" "$2")/ledger" | wc -l; }
+
+count() { grep -c . <<<"$1" || true; }
+
+ledger_diff() {
+  local fixture="$REPO/tests/fixtures/agent-ledger/$TXNS"
+  note "\$ diff -u <fixture>/$TXNS <ledger>/$TXNS"
+  diff -u "$fixture" "$(txns_file "$1" "$2")" >>"$TRANSCRIPT" || true
+  ADDED=$(diff "$fixture" "$(txns_file "$1" "$2")" | sed -n 's/^> //p' || true)
+  ADDED_HEADERS=$(grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' <<<"$ADDED" || true)
+}
 
 field() { jq -r "$1" "$BODY" 2>/dev/null || echo "<body is not JSON>"; }
 
@@ -919,8 +939,12 @@ claude_run() {
     --output-format stream-json --verbose --no-session-persistence "$@") \
     </dev/null >"$w/$slug.jsonl" 2>"$w/$slug.stderr" || status=$?
   note "claude exit status: $status (raw stream $w/$slug.jsonl)"
-  CLAUDE_EVENTS="$w/$slug.events"
-  jq -cR "$STREAM_EVENTS" "$w/$slug.jsonl" >"$CLAUDE_EVENTS"
+  record_stream "$w/$slug.jsonl"
+}
+
+record_stream() {
+  CLAUDE_EVENTS="${1%.jsonl}.events"
+  jq -cR "$STREAM_EVENTS" "$1" >"$CLAUDE_EVENTS"
   jq -r 'if .kind == "tool_use" then "tool_use \(.name) \(.input | tojson)"
     elif .kind == "tool_result" then "tool_result \((.text // "")[0:1500])"
     else "result: \(.text)" end' "$CLAUDE_EVENTS" >>"$TRANSCRIPT"
@@ -1015,19 +1039,15 @@ mlane4() {
 mlane5() {
   start_lane 5 lane5-add
   cmd_boot 5 "$TARGET"
-  local fixture added headers mcp_lines
-  fixture="$REPO/tests/fixtures/agent-ledger/$TXNS"
+  local mcp_lines
   claude_run 5 "$TARGET" lane5-add list_accounts,query,add_transaction '記錄「9/24 晚餐 190（錢包）」' \
     --append-system-prompt "You record expenses in the user's beancount ledger through the beancount MCP tools."
-  note "\$ diff -u <fixture>/$TXNS <ledger>/$TXNS"
-  diff -u "$fixture" "$(txns_file 5 "$TARGET")" >>"$TRANSCRIPT" || true
-  added=$(diff "$fixture" "$(txns_file 5 "$TARGET")" | sed -n 's/^> //p' || true)
-  headers=$(grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' <<<"$added" || true)
-  check "transactions added" "$(grep -c . <<<"$headers" || true)" 1
-  check "added header starts with 2026-09-24 !" "$(cut -c1-12 <<<"$headers")" "2026-09-24 !"
+  ledger_diff 5 "$TARGET"
+  check "transactions added" "$(count "$ADDED_HEADERS")" 1
+  check "added header starts with 2026-09-24 !" "$(cut -c1-12 <<<"$ADDED_HEADERS")" "2026-09-24 !"
   check "posting Expenses:Food:Dinner 190 TWD" \
-    "$(yes_no grep -qE '^ +Expenses:Food:Dinner +190 TWD$' <<<"$added")" yes
-  check "posting Assets:TW:Cash" "$(yes_no grep -qE '^ +Assets:TW:Cash( |$)' <<<"$added")" yes
+    "$(yes_no grep -qE '^ +Expenses:Food:Dinner +190 TWD$' <<<"$ADDED")" yes
+  check "posting Assets:TW:Cash" "$(yes_no grep -qE '^ +Assets:TW:Cash( |$)' <<<"$ADDED")" yes
   mcp_lines=$(mcp_log_lines 5 "$TARGET")
   note "container log, lines starting with 'mcp ':"
   note "$mcp_lines"
@@ -1182,6 +1202,371 @@ cmd_images() {
   echo "trunk $TRUNK_IMAGE ($TRUNK_REF $(git -C "$REPO" rev-parse --short "$TRUNK_REF")) $(docker image inspect --format '{{.Id}}' "$TRUNK_IMAGE")"
 }
 
+BOOKING='9/24 晚餐 190（錢包）'
+DOC="$REPO/docs/agent-api.md"
+
+tools_call_count() { docker logs "$(fava "$1" "$2")" 2>&1 | grep -c '^mcp tools/call ' || true; }
+
+skill_used() {
+  if jq -es 'any(.[]; .kind == "tool_use" and .name == "Skill" and .input.skill == "beancount-ledger")' \
+    "$CLAUDE_EVENTS" >/dev/null; then echo yes; else echo no; fi
+}
+
+proxied_403() { grep -cx '  status: 403' "$SKILL_PROXY_LOG" || true; }
+
+dinner_booked() {
+  if [ "$(count "$ADDED_HEADERS")" = 1 ] && [ "$(cut -c1-12 <<<"$ADDED_HEADERS")" = "2026-09-24 !" ] &&
+    grep -qE '^ +Expenses:Food:Dinner +190 TWD$' <<<"$ADDED"; then echo yes; else echo no; fi
+}
+
+# --setting-sources project and --strict-mcp-config, in a fresh project dir, keep the operator's user
+# settings, skills, plugins, CLAUDE.md, and MCP servers out of the session.
+skill_run() {
+  local n=$1 target=$2 slug=$3 mode=$4 prompt=$5 w project proxy config tools
+  w=$(wdir "$n")
+  project="$w/project-$slug"
+  rm -rf "$project"
+  mkdir -p "$project/.claude/skills"
+  if [ "$target" = head ]; then
+    cp -r "$REPO/skills/beancount-ledger" "$project/.claude/skills/"
+    note "skill: $REPO/skills/beancount-ledger copied to <project>/.claude/skills/"
+  elif git -C "$REPO" cat-file -e "$TRUNK_REF:skills/beancount-ledger" 2>/dev/null; then
+    git -C "$REPO" archive "$TRUNK_REF" skills/beancount-ledger | tar -x -C "$project/.claude"
+    note "skill: skills/beancount-ledger from $TRUNK_REF"
+  else
+    note "skill: none, $TRUNK_REF has no skills/beancount-ledger"
+  fi
+  recording_proxy_start "$n" "$target"
+  proxy="http://127.0.0.1:$(cat "$w/proxy.port")"
+  if [ "$mode" = mcp ]; then
+    config=$(jq -nc --arg url "$proxy$MCP_PATH" --arg auth "Bearer $(token "$n")" \
+      '{mcpServers: {beancount: {type: "http", url: $url, headers: {Authorization: $auth}}}}')
+    tools=(--tools Skill
+      --allowedTools 'Skill,mcp__beancount__list_accounts,mcp__beancount__query,mcp__beancount__add_transaction')
+  else
+    config='{"mcpServers":{}}'
+    tools=(--tools 'Skill,Bash' --allowedTools Skill 'Bash(curl:*)')
+  fi
+  note "\$ cd <project> && TZ=Asia/Taipei BEANCOUNT_FAVA_URL=http://127.0.0.1:<proxy to $target>/$BFILE BEANCOUNT_AGENT_TOKEN=<worker token> timeout 300 claude -p <prompt> --model haiku --setting-sources project --strict-mcp-config --mcp-config <$mode config> ${tools[*]} --output-format stream-json --verbose --no-session-persistence"
+  note "mcp config: ${config//$(token "$n")/<worker token>}"
+  note "prompt: $prompt"
+  SKILL_STATUS=0
+  SKILL_START=$(date +%s.%N)
+  (cd "$project" && TZ=Asia/Taipei BEANCOUNT_FAVA_URL="$proxy/$BFILE" BEANCOUNT_AGENT_TOKEN="$(token "$n")" \
+    timeout 300 claude -p "$prompt" --model haiku --setting-sources project --strict-mcp-config \
+    --mcp-config "$config" "${tools[@]}" --output-format stream-json --verbose --no-session-persistence) \
+    </dev/null >"$w/$slug.jsonl" 2>"$w/$slug.stderr" || SKILL_STATUS=$?
+  SKILL_SECONDS=$(awk -v s="$SKILL_START" -v e="$(date +%s.%N)" 'BEGIN {printf "%.1f", e - s}')
+  recording_proxy_stop "$n"
+  SKILL_PROXY_LOG="$w/$slug.proxy.log"
+  cp "$w/proxy.log" "$SKILL_PROXY_LOG"
+  note "claude exit status: $SKILL_STATUS after $SKILL_SECONDS s (raw stream $w/$slug.jsonl)"
+  record_stream "$w/$slug.jsonl"
+  note "Skill beancount-ledger used: $(skill_used)"
+  note "container log, 'mcp tools/call' lines so far: $(tools_call_count "$n" "$target")"
+  note "proxy log ($target):"
+  cat "$SKILL_PROXY_LOG" >>"$TRANSCRIPT"
+}
+
+slane1() {
+  start_lane 1 lane1-regression
+  cmd_boot 1 trunk
+  cmd_boot 1 head
+  note "claude --version: $(claude --version)"
+  skill_run 1 trunk trunk-booking mcp "$BOOKING"
+  check "trunk: claude finished" "$SKILL_STATUS" 0
+  ledger_diff 1 trunk
+  note "trunk: tool calls: $(jq -r 'select(.kind == "tool_use") | .name' "$CLAUDE_EVENTS" | paste -sd' ')"
+  note "trunk: transactions added: $(count "$ADDED_HEADERS")"
+  note "trunk: container log, 'mcp tools/call' lines: $(tools_call_count 1 trunk)"
+  note "trunk: reply: $(claude_text result)"
+  skill_run 1 head head-booking mcp "$BOOKING"
+  ledger_diff 1 head
+  check "head: transactions added" "$(count "$ADDED_HEADERS")" 1
+  check "head: added header starts with 2026-09-24 !" "$(cut -c1-12 <<<"$ADDED_HEADERS")" "2026-09-24 !"
+  check "head: posting Expenses:Food:Dinner 190 TWD" \
+    "$(yes_no grep -qE '^ +Expenses:Food:Dinner +190 TWD$' <<<"$ADDED")" yes
+  check "head: posting Assets:TW:Cash -190 TWD" "$(yes_no grep -qE '^ +Assets:TW:Cash +-190 TWD$' <<<"$ADDED")" yes
+  check "head: proxied 403 responses" "$(proxied_403)" 0
+  check "head: Skill beancount-ledger used" "$(skill_used)" yes
+  check "head: reply shows 2026-09-24 !" "$(yes_no grep -qF '2026-09-24 !' <(claude_text result))" yes
+  note "head: container log, 'mcp tools/call' lines: $(tools_call_count 1 head)"
+  end_lane 1
+}
+
+slane2() {
+  start_lane 2 lane2-ambiguous
+  cmd_boot 2 "$TARGET"
+  local before reply
+  before=$(tree_sha 2 "$TARGET")
+  skill_run 2 "$TARGET" lane2-ambiguous mcp '9/24 午餐 120（錢包）'
+  reply=$(claude_text result)
+  check "ledger unchanged" "$(tree_sha 2 "$TARGET")" "$before"
+  check "reply names Expenses:Food:Lunch" "$(yes_no grep -qE 'Expenses:Food:Lunch|食物/午餐' <<<"$reply")" yes
+  check "reply names Expenses:Work:Lunch" "$(yes_no grep -qE 'Expenses:Work:Lunch|公務/午餐' <<<"$reply")" yes
+  check "Skill beancount-ledger used" "$(skill_used)" yes
+  end_lane 2
+}
+
+slane3() {
+  start_lane 3 lane3-duplicate
+  cmd_boot 3 "$TARGET"
+  skill_run 3 "$TARGET" session-a mcp "$BOOKING"
+  ledger_diff 3 "$TARGET"
+  check "session A: transactions added" "$(count "$ADDED_HEADERS")" 1
+  check "session A: added header starts with 2026-09-24 !" "$(cut -c1-12 <<<"$ADDED_HEADERS")" "2026-09-24 !"
+  skill_run 3 "$TARGET" session-b mcp "$BOOKING"
+  ledger_diff 3 "$TARGET"
+  check "after session B: transactions added" "$(count "$ADDED_HEADERS")" 1
+  note "session B reply: $(claude_text result)"
+  check "session B: reply reports a duplicate" \
+    "$(yes_no grep -qE '重複|已存在|已經有|duplicate|already' <(claude_text result))" yes
+  check "session B: Skill beancount-ledger used" "$(skill_used)" yes
+  end_lane 3
+}
+
+slane4() {
+  start_lane 4 lane4-time
+  local today extra='2026-01-01 open Expenses:Food:Breakfast TWD
+  name-zh: "食物/早餐"'
+  note "appended to main.beancount:"
+  note "$extra"
+  LEDGER_EXTRA=$extra cmd_boot 4 "$TARGET"
+  today=$(TZ=Asia/Taipei date +%F)
+  note "today in Asia/Taipei: $today"
+  skill_run 4 "$TARGET" lane4-time mcp '今天早上 7 點早餐 80（錢包）'
+  ledger_diff 4 "$TARGET"
+  check "transactions added" "$(count "$ADDED_HEADERS")" 1
+  check "added header starts with $today !" "$(cut -c1-12 <<<"$ADDED_HEADERS")" "$today !"
+  check "time metadata" "$(yes_no grep -qE '^ +time: "07:00:00"$' <<<"$ADDED")" yes
+  check "posting Expenses:Food:Breakfast 80 TWD" \
+    "$(yes_no grep -qE '^ +Expenses:Food:Breakfast +80 TWD$' <<<"$ADDED")" yes
+  end_lane 4
+}
+
+slane5() {
+  start_lane 5 lane5-unknown-account
+  cmd_boot 5 "$TARGET"
+  local before
+  before=$(tree_sha 5 "$TARGET")
+  skill_run 5 "$TARGET" lane5-unknown-account mcp '9/24 晚餐 190（國泰信用卡）'
+  check "ledger unchanged" "$(tree_sha 5 "$TARGET")" "$before"
+  check "reply names 國泰信用卡" "$(yes_no grep -qF '國泰信用卡' <(claude_text result))" yes
+  check "Skill beancount-ledger used" "$(skill_used)" yes
+  end_lane 5
+}
+
+slane6() {
+  start_lane 6 lane6-delete-refused
+  cmd_boot 6 "$TARGET"
+  local before
+  post 6 "$TARGET" "$(dinner d1)" -H "$(bearer 6)"
+  check "seed 2026-09-24 ! ^ik-d1" "$STATUS" 201
+  before=$(tree_sha 6 "$TARGET")
+  skill_run 6 "$TARGET" lane6-delete-refused mcp '把 9/24 那筆刪掉'
+  check "ledger unchanged" "$(tree_sha 6 "$TARGET")" "$before"
+  check "reply points to fava" "$(yes_no grep -qiF fava <(claude_text result))" yes
+  check "proxied PUT or DELETE requests" "$(grep -cE '^(PUT|DELETE) ' "$SKILL_PROXY_LOG" || true)" 0
+  check "proxied 403 responses" "$(proxied_403)" 0
+  end_lane 6
+}
+
+slane7() {
+  start_lane 7 lane7-approve-refused
+  cmd_boot 7 "$TARGET"
+  local before
+  post 7 "$TARGET" "$(dinner d1)" -H "$(bearer 7)"
+  check "seed 2026-09-24 ! ^ik-d1" "$STATUS" 201
+  before=$(tree_sha 7 "$TARGET")
+  skill_run 7 "$TARGET" lane7-approve-refused mcp '直接核准 9/24 那筆'
+  check "ledger unchanged" "$(tree_sha 7 "$TARGET")" "$before"
+  check "2026-09-24 ! ^ik-d1 still in $TXNS" \
+    "$(grep -cxF '2026-09-24 ! ^ik-d1' "$(txns_file 7 "$TARGET")" || true)" 1
+  check "reply points to fava" "$(yes_no grep -qiF fava <(claude_text result))" yes
+  end_lane 7
+}
+
+slane8() {
+  start_lane 8 lane8-no-mcp
+  cmd_boot 8 "$TARGET"
+  local requests
+  skill_run 8 "$TARGET" lane8-no-mcp curl '9/24 晚餐 190（錢包），9/25 晚餐 210（錢包）'
+  ledger_diff 8 "$TARGET"
+  check "transactions added" "$(count "$ADDED_HEADERS")" 2
+  check "added headers" "$(cut -c1-12 <<<"$ADDED_HEADERS" | sort | paste -sd,)" "2026-09-24 !,2026-09-25 !"
+  check "dinner amount by date" \
+    "$(awk '/^[0-9]/ {date = $1} $1 == "Expenses:Food:Dinner" {print date, $2, $3}' <<<"$ADDED" | sort | paste -sd,)" \
+    "2026-09-24 190 TWD,2026-09-25 210 TWD"
+  check "distinct ^ik- links added" "$(count "$(grep -oE '\^ik-[A-Za-z0-9_/.-]+' <<<"$ADDED" | sort -u)")" 2
+  requests=$(grep -E '^[A-Z]+ /' "$SKILL_PROXY_LOG" || true)
+  check "proxied requests outside ledger_data, query, and POST transactions" \
+    "$(count "$(grep -vE "^(GET /$BFILE/api/(ledger_data|query)([?].*)?|POST $WRITE_PATH)\$" <<<"$requests" || true)")" 0
+  check "proxied reads" "$(yes_no grep -qE "^GET /$BFILE/api/(ledger_data|query)" <<<"$requests")" yes
+  check "proxied POSTs answered 201" "$(awk -v RS= -v path="$WRITE_PATH" '
+    index($0, "POST " path "\n") == 1 && /\n  status: 201\n/ {n++} END {print n + 0}' "$SKILL_PROXY_LOG")" 2
+  check "proxied 403 responses" "$(proxied_403)" 0
+  end_lane 8
+}
+
+doc_code_block() {
+  local step=$1 lang=$2
+  awk -v section="### $step. " -v lang="$lang" '
+    index($0, "### ") == 1 { in_section = index($0, section) == 1 }
+    in_section && !open && $0 ~ "^ *```" lang "$" { open = 1; indent = index($0, "`") - 1; next }
+    open && /^ *```$/ { exit }
+    open { print substr($0, indent + 1) }' "$DOC"
+}
+
+# The doc's files belong to uid 99 or root, so only a root container can read or remove them.
+as_root() { docker run --rm -i --user 0 --entrypoint "$2" -v "$1:/data" "$HEAD_IMAGE" "${@:3}"; }
+
+slane9() {
+  start_lane 9 lane9-deploy-doc
+  ensure_stub 9
+  local app d name line cmd part doc_token w
+  w=$(wdir 9)
+  app="$w/appdata"
+  d=$(idir 9 deploy)
+  name=$(fava 9 deploy)
+  mkdir -p "$app" "$d"
+  as_root "$app" find /data -mindepth 1 -delete
+  note "$app stands for /mnt/user/appdata/beancount"
+  cp -r "$REPO/tests/fixtures/agent-ledger" "$app/ledger"
+  sed -i -e '/custom "fava-extension"/d' -e 's/^option "title" .*/option "title" "beancount"/' \
+    "$app/ledger/main.beancount"
+  line=$(doc_code_block 4 beancount)
+  note "step 4 line: $line"
+  check "step 4 shows one beancount line" "$(count "$line")" 1
+  echo "$line" >>"$app/ledger/main.beancount"
+  cmd=$(doc_code_block 1 sh | sed 's#/mnt/user/appdata/beancount#/data#g')
+  note "step 1 as root, $app at /data, then chown -R 99:100 /data/ledger:"
+  note "$cmd"
+  as_root "$app" sh -e <<<"$cmd
+chown -R 99:100 /data/ledger"
+  as_root "$app" ls -lnR /data >>"$TRANSCRIPT"
+  doc_token=$(as_root "$app" cat /data/agent-token)
+  cmd=$(doc_code_block 3 sh | sed -e "s#/mnt/user/appdata/beancount#$app#g" -e "s#--name beancount-fava#--name $name#" \
+    -e 's#-p 5656:5000#-p 127.0.0.1::5000#' -e "s#https://<team>.cloudflareaccess.com#$(team_domain 9)#" \
+    -e "s#<aud-tag>#$AUD#" -e "s#gn00678465/beancount-fava:<tag>#$HEAD_IMAGE#" \
+    -e "s#^docker run -d #docker run -d --network $(net 9) #")
+  note "step 3, substituted:"
+  note "$cmd"
+  for part in "--network $(net 9)" "--name $name" "--user 99:100" "-p 127.0.0.1::5000" \
+    "CF_ACCESS_TEAM_DOMAIN=$(team_domain 9)" "CF_ACCESS_AUD=$AUD" "$HEAD_IMAGE"; do
+    check "step 3 command has $part" "$(yes_no grep -qF -- "$part" <<<"$cmd")" yes
+  done
+  bash -c "$cmd" >/dev/null
+  docker port "$name" 5000/tcp | head -1 | sed 's/.*://' >"$d/port"
+  wait_url "$name" "http://127.0.0.1:$(port 9 deploy)/beancount/api/errors" "Authorization: Bearer $doc_token"
+  note "log:"
+  docker logs "$name" >>"$TRANSCRIPT" 2>&1
+  check "log has Starting Fava on http://0.0.0.0:5000" \
+    "$(yes_no grep -qF 'Starting Fava on http://0.0.0.0:5000' <(docker logs "$name" 2>&1))" yes
+  request 9 deploy GET /beancount/api/errors
+  check "errors without credential" "$STATUS" 401
+  request 9 deploy GET /beancount/api/errors -H "Authorization: Bearer $doc_token"
+  check "errors with the token" "$STATUS" 200
+  check "errors .data" "$(field '.data | tojson')" "[]"
+  request 9 deploy GET /beancount/income_statement/ -H "$(assertion "$(cmd_jwt 9)")"
+  check "income_statement with a JWT" "$STATUS" 200
+  local project="$w/project-deploy" cfg="$w/claude-deploy"
+  rm -rf "$project" "$cfg"
+  mkdir -p "$project" "$cfg"
+  recording_proxy_start 9 deploy
+  doc_code_block 6 json | sed "s#http://192.168.2.11:5656#http://127.0.0.1:$(cat "$w/proxy.port")#g" >"$project/.mcp.json"
+  echo '{"enabledMcpjsonServers":["beancount"]}' >"$cfg/settings.json"
+  note "step 6 .mcp.json:"
+  cat "$project/.mcp.json" >>"$TRANSCRIPT"
+  note "CLAUDE_CONFIG_DIR settings.json, standing for the one-time approval: $(cat "$cfg/settings.json")"
+  note "\$ BEANCOUNT_AGENT_TOKEN=<token file content> claude mcp list"
+  (cd "$project" && CLAUDE_CONFIG_DIR="$cfg" BEANCOUNT_AGENT_TOKEN="$doc_token" timeout 120 claude mcp list) \
+    </dev/null >"$w/mcp-list.txt" 2>&1 || true
+  recording_proxy_stop 9
+  cat "$w/mcp-list.txt" >>"$TRANSCRIPT"
+  note "proxy log:"
+  cat "$w/proxy.log" >>"$TRANSCRIPT"
+  check "claude mcp list shows beancount connected" "$(yes_no grep -qE \
+    '^beancount: http://127\.0\.0\.1:[0-9]+/beancount/extension/AgentApi/mcp \(HTTP\) - ✔ Connected' \
+    "$w/mcp-list.txt")" yes
+  end_lane 9
+  as_root "$app" find /data -mindepth 1 -delete
+}
+
+slane10() {
+  start_lane 10 lane10-compose
+  ensure_stub 10
+  local d example="$REPO/compose.example.yaml" project="$PREFIX-w10" status=0
+  d=$(idir 10 compose)
+  docker compose -p "$project" down -v >/dev/null 2>&1 || true
+  rm -rf "$d"
+  mkdir -p "$d"
+  note "\$ docker compose -f compose.example.yaml config -q"
+  docker compose -f "$example" config -q >>"$TRANSCRIPT" 2>&1 || status=$?
+  check "compose.example.yaml config -q exit status" "$status" 0
+  cp -r "$REPO/tests/fixtures/agent-ledger" "$d/ledger"
+  cp "$(wdir 10)/token" "$d/agent-token"
+  sed -e "s#^\( *image: \).*#\1$HEAD_IMAGE#" -e 's#"127.0.0.1:5000:5000"#"127.0.0.1::5000"#' "$example" >"$d/compose.yaml"
+  note "\$ diff -u compose.example.yaml compose.yaml"
+  diff -u "$example" "$d/compose.yaml" >>"$TRANSCRIPT" || true
+  check "lines changed from the example" "$(diff "$example" "$d/compose.yaml" | grep -c '^>' || true)" 2
+  docker compose -p "$project" -f "$d/compose.yaml" up -d >>"$TRANSCRIPT" 2>&1
+  docker compose -p "$project" -f "$d/compose.yaml" port fava 5000 | sed 's/.*://' >"$d/port"
+  wait_url "$project-fava-1" "http://127.0.0.1:$(port 10 compose)/$BFILE/api/errors" "$(bearer 10)"
+  post 10 compose "$(dinner d1)" -H "$(bearer 10)"
+  check "write" "$STATUS" 201
+  request 10 compose GET "/$BFILE/api/errors" -H "$(bearer 10)"
+  check "errors" "$STATUS" 200
+  check "errors .data" "$(field '.data | tojson')" "[]"
+  docker compose -p "$project" -f "$d/compose.yaml" down -v >>"$TRANSCRIPT" 2>&1
+  end_lane 10
+}
+
+cmd_perf_skill() {
+  local n=perf rounds=5 i target w changed trunk_median head_median result
+  w=$(wdir $n)
+  cmd_down $n
+  rm -rf "$w"
+  mkdir -p "$w"
+  TRANSCRIPT="$w/perf-skill.txt"
+  {
+    echo "# perf-skill: claude -p '$BOOKING' in MCP mode; head loads the beancount-ledger Skill, trunk has none"
+    echo "# trunk image $(docker image inspect --format '{{.Id}}' "$TRUNK_IMAGE")"
+    echo "# head image  $(docker image inspect --format '{{.Id}}' "$HEAD_IMAGE")"
+    echo "# $rounds interleaved rounds of trunk then head, each on a fresh fava and ledger"
+  } >"$TRANSCRIPT"
+  : >"$w/rows"
+  for ((i = 1; i <= rounds; i++)); do
+    for target in trunk head; do
+      note "## round $i $target"
+      cmd_boot $n $target
+      skill_run $n $target "$target-$i" mcp "$BOOKING"
+      ledger_diff $n $target
+      changed=-
+      cmp -s "$REPO/tests/fixtures/agent-ledger/$TXNS" "$(txns_file $n $target)" ||
+        changed=$(awk -v s="$SKILL_START" -v m="$(stat -c %.3Y "$(txns_file $n $target)")" \
+          'BEGIN {printf "%.1f", m - s}')
+      echo "$i $target $SKILL_SECONDS $changed $(tools_call_count $n $target) $(dinner_booked) $(skill_used)" \
+        >>"$w/rows"
+      docker rm -f "$(fava $n $target)" >/dev/null
+    done
+  done
+  trunk_median=$(awk '$2 == "trunk" {print $3}' "$w/rows" | median)
+  head_median=$(awk '$2 == "head" {print $3}' "$w/rows" | median)
+  result=$(awk -v h="$head_median" -v t="$trunk_median" '
+    $2 == "head" && ($5 > 3 || $6 != "yes") {bad = 1}
+    END {print (!bad && h <= 1.5 * t) ? "PASS" : "FAIL"}' "$w/rows")
+  {
+    echo "# columns: round target claude-wall-s ledger-written-after-s tools/call dinner-written skill-used"
+    sed 's/^/round /' "$w/rows"
+    echo "trunk median wall (baseline): $trunk_median s"
+    echo "head median wall:             $head_median s"
+    echo "ratio head/trunk: $(awk -v h="$head_median" -v t="$trunk_median" 'BEGIN {printf "%.3f", h / t}')"
+    echo "RESULT: $result (every head run: tools/call <= 3 and the dinner written; head median wall <= 1.5 x trunk median)"
+  } >>"$TRANSCRIPT"
+  cmd_down $n
+  echo "perf-skill: $result  $TRANSCRIPT"
+}
+
 case "${1:-}" in
 images) cmd_images ;;
 boot) cmd_boot "$2" "${3:-head}" ;;
@@ -1208,8 +1593,15 @@ mcp-all)
   for n in 1 2 3 4 5 6 7 8 9 10; do "mlane$n"; done
   cmd_perf_mcp
   ;;
+skill-lane) "slane$2" ;;
+perf-skill) cmd_perf_skill ;;
+skill-all)
+  cmd_images
+  for n in 1 2 3 4 5 6 7 8 9 10; do "slane$n"; done
+  cmd_perf_skill
+  ;;
 *)
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  awk 'NR == 1 {next} !/^#/ {exit} {sub(/^# ?/, ""); print}' "$0"
   exit 2
   ;;
 esac
