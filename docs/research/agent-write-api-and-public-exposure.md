@@ -16,6 +16,16 @@
 > 2. **推論錯誤**：「`add_entries` 沒有樂觀鎖」不是缺陷。插入操作在鎖內即時讀檔，不依據客戶端的舊內容（2.3(c) 節）。
 > 3. **建議不成立**：第 5.3 節建議方案 (d)（fava `--read-only`）。它的理由有兩條建立在上述兩項錯誤上，並且漏了一個需求：agent 以 `!` flag 提出交易後，人類要在 fava 中改成 `*` 核准，fava 設成 read-only 後這個流程沒有 UI。5.2(a) 的「致命點」也言過其實：公網上的 fava 由 Cloudflare Access 認證，可寫入的 fava 正是使用者要的 web UI。**修正後的建議是方案 (a)**：fava 是唯一寫入 process，自建 API 經由 fava 的 JSON API 寫入，並在 API 層補上認證、冪等、驗證、`!` flag、git commit。第 1.2、5.3、14.2、15.2 節中依 (d) 寫的內容以本更正為準。
 
+> **2026-09-30 最終決定**（`docs/plans/agent-write-api.md`，實作在 `src/beancount_agent_api/`，部署與參考見 `docs/agent-api.md`）
+>
+> 上面修正後的方案 (a) 也沒有照原樣採用。最終做法如下。本文中與它衝突的建議以這段為準。
+>
+> 1. **寫入在 fava 的 process 內完成。** API 是 fava extension `AgentApi`，也就是 5.2 節的方案 (c)。冪等檢查與寫入在同一個 `threading.Lock` 內。沒有獨立的 API container，fava 不以 `--read-only` 執行。
+> 2. **以 WSGI guard 保護整個 fava。** guard 包住 fava 的 `wsgi_app`，每個請求都要有憑證。不用 `--read-only`，因為人類要在 fava 網頁核准 `!` 交易。不用 extension 的 `before_request` hook，因為 fava 對 `/api/changed` 與 `/api/errors` 不執行這個 hook。
+> 3. **瀏覽器以 Cloudflare Access 的 JWT 認證。** guard 驗證 `Cf-Access-Jwt-Assertion` 的 RS256 簽章、`aud`、`iss`、`exp`（9.5 節）。瀏覽器可以使用 fava 的全部功能。
+> 4. **Agent 在區網以 Bearer token 認證。** Agent 只能呼叫 fava `/api/` 的 GET 端點與 `AgentApi` 的端點，其他請求回 403。Agent 不經過 Cloudflare，不使用 service token（9.4 節）。
+> 5. **MCP 只實作 `2026-07-28`。** MCP 端點在同一個 extension 內手寫，與 REST 端點共用寫入程式。沒有 stdio、`mcp` SDK 或 legacy `initialize`。7.5 節的建議因此已過時。
+
 ---
 
 ## 1. 摘要
@@ -849,7 +859,7 @@ API 對 agent 的寫入一律附加到 `agent-inbox.beancount` 的末尾。這�
 
 ### 7.1 MCP 規格現況（查詢日期 2026-09-21）
 
-**規格版本**：官方 repo `docs/specification/` 下有 `2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25`、`2026-07-28`、`draft`。**最新正式版是 `2026-07-28`**。
+**規格版本**：官方 repo `docs/specification/` 下有 `2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25`、`2026-07-28`、`draft`。**最新正式版是 `2026-07-28`**。2026-09-30 複查結果相同，`draft` 沒有新的變更（`mcp-spec-2026-09.md` 第 2 節）。
 來源：<https://github.com/modelcontextprotocol/modelcontextprotocol/tree/main/docs/specification>
 
 **2026-07-28 的重大變更**（直接影響 server 實作成本，逐條引自官方 changelog）：
@@ -864,7 +874,9 @@ API 對 agent 的寫入一律附加到 `agent-inbox.beancount` 的末尾。這�
 
 來源：<https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2026-07-28/changelog.mdx>
 
-**對本專案的意義**：一個無狀態的 Streamable HTTP MCP server 現在在架構上幾乎等同一個 REST 端點 —— 單一 POST URL，每個請求自包含。**沒有長連線需求，Cloudflare Tunnel 不需要任何特殊設定。**（除非用 `subscriptions/listen`，本專案不需要。）
+**2026-09-30 更正**：上面的清單不完整。`2026-07-28` 另外移除 `ping`，要求每個結果帶 `resultType`，要求清單類結果帶 `ttlMs` 與 `cacheScope`，加入 MRTR，把 tasks 移出核心成為 extension，重新編排錯誤碼，要求未知方法回 HTTP 404，並把 HTTP+SSE transport 列為 Deprecated。第 6 項在 changelog 中屬於 minor change。逐項比較見 `mcp-spec-2026-09.md` 第 3 節。
+
+**對本專案的意義**：一個無狀態的 Streamable HTTP MCP server 現在在架構上幾乎等同一個 REST 端點 —— 單一 POST URL，每個請求自包含。**沒有長連線需求，Cloudflare Tunnel 不需要任何特殊設定。**（除非用 `subscriptions/listen`，本專案不需要。）server 仍要檢查 `MCP-Protocol-Version`、`Mcp-Method`、`Mcp-Name` header 與 body 一致。server 回 SSE 時要處理 proxy 的緩衝（`X-Accel-Buffering: no`）。這兩句是 2026-09-30 補充。
 
 **授權規格**（來源：<https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2026-07-28/basic/authorization/index.mdx>）：
 
@@ -875,8 +887,9 @@ API 對 agent 的寫入一律附加到 `agent-inbox.beancount` 的末尾。這�
 - 「MCP servers **MUST** implement OAuth 2.0 Protected Resource Metadata (RFC9728).」
 - 「Authorization servers **MUST** implement OAuth 2.1 with appropriate security measures for both confidential and public clients.」
 - Dynamic Client Registration (RFC7591) 現已「deprecated and retained for backwards compatibility」，優先用 Client ID Metadata Documents。
+- `basic/index.mdx` 另寫明 client 與 server「MAY negotiate their own custom authentication and authorization strategies」。固定 Bearer token 屬於這一類（2026-09-30 補充，`mcp-spec-2026-09.md` 6.1 節）。
 
-**這是本專案的一個重要決策點**：要做一個**符合規格的、有授權的 HTTP MCP server**，就等於要架一個 OAuth 2.1 authorization server 並實作 RFC 9728 metadata endpoint。這遠超出「一個 container 跑 fava + 一個 API」的規模。
+**這是本專案的一個重要決策點**：要做一個**符合規格的、有授權的 HTTP MCP server**，server 要實作 RFC 9728 metadata endpoint，並驗證 authorization server 簽發的 token。MCP server 是 resource server，authorization server 可以是另一個現成的服務（`2026-07-28/basic/authorization/index.mdx` 第 47 至 58 行）。**2026-09-30 更正**：原文說這等於要自己架一個 OAuth 2.1 authorization server，這不正確。
 
 **兩條務實路徑**：
 
@@ -894,6 +907,8 @@ API 對 agent 的寫入一律附加到 `agent-inbox.beancount` 的末尾。這�
 - 啟動 Streamable HTTP：`uv run mcp run server.py --transport streamable-http`。
 
 來源：<https://github.com/modelcontextprotocol/python-sdk/blob/main/README.md>
+
+2026-09-30 補充：同日另有 v1 線的 `1.30.0`。SDK 的 HTTP 層以 Starlette（ASGI）為基礎，repo 中沒有 WSGI 介面，所以不能直接掛在 fava 的 Flask（WSGI）上（`mcp-spec-2026-09.md` 7.2 節）。
 
 **對 image 的影響**：`mcp>=2.2.0` 要求 Python `>=3.10`，與 fava 的 `>=3.10` 相容。既有研究建議的 Python 3.13 可用。SDK 是純 Python（推論；未逐一檢查 wheel 標籤）。
 
@@ -930,9 +945,11 @@ API 對 agent 的寫入一律附加到 `agent-inbox.beancount` 的末尾。這�
 | 本機使用 | 需要跑 HTTP server | stdio 可直接由 client 啟動子程序，零網路曝露 |
 | 公網使用 | 成熟 | Streamable HTTP；2026-07-28 起無狀態，部署變簡單 |
 | 人類可用性 | curl、瀏覽器、Postman 都能用 | 需要 MCP client |
-| 穩定性 | HTTP/OpenAPI 極穩定 | 規格 18 個月內改了 5 個版本，2026-07-28 是破壞性重構 |
+| 穩定性 | HTTP/OpenAPI 極穩定 | 從 `2024-11-05` 到 `2026-07-28` 約 20 個月，共發佈 5 個版本（含第一版；2026-09-30 更正，原文為 18 個月內改了 5 個版本）。2026-07-28 是破壞性重構 |
 
 ### 7.5 建議：兩者並存，共用同一個寫入核心
+
+> **2026-09-30：本節已過時。** 最終做法是在 fava extension `AgentApi` 內手寫只支援 `2026-07-28` 的 HTTP MCP 端點，與 REST 端點共用同一段寫入程式。沒有 stdio、`mcp` SDK、FastAPI 或獨立 container（開頭的最終決定、`mcp-spec-2026-09.md` 第 9.2 節 R12）。「共用同一個寫入核心」仍然成立。
 
 **架構**：
 
