@@ -4,15 +4,15 @@ fava 的每個請求都要有憑證。瀏覽器經由 Cloudflare Access 登入�
 Agent 讀取沿用 fava `/api/` 的 GET 端點。Agent 寫入只走新的 extension，交易一律是 `!` flag，同一個 idempotency key 只寫入一次。
 Agent 呼叫 fava `/api/` 的 PUT、DELETE 或 fava 網頁時，guard 回 403。這是執行期的強制規則，不是約定。
 服務對象是替使用者記帳的 Agent（Claude Code 等），以及在 fava 網頁上核准交易的使用者。
-PR 依序為 AGENT-1（guard 與啟動程式）、AGENT-2（REST 寫入端點）、AGENT-3（MCP 端點）、AGENT-4（Skill、部署說明、研究筆記）。
+全部工作在單一分支 `feat/agent-api` 上，最後開一個 PR。分支依序包含研究筆記與本計畫，以及 AGENT-1（guard 與啟動程式）、AGENT-2（REST 寫入端點）、AGENT-3（MCP 端點）、AGENT-4（Skill 與部署說明）四個單元。
 
 ## How to read this
 
 One box is one unit of work. Every box names the evidence that checks it. A nested box is a sub-step of the box above it. Check a box only when its evidence exists, a file, a log line, a screenshot, a test run, or a SHA. The body is a how-to. The appendices explain and record.
 
-研究筆記與本計畫已 commit 在分支 `docs/agent-write-research`，不在 stack 內。每個 PR 都在自己的分支上 commit，不直接 commit 到 `main`。
+研究筆記與本計畫是 `feat/agent-api` 的第一個 commit（`4c2feba`）。四個單元依序疊在它上面，不直接 commit 到 `main`。下文的「PR」指一個單元，每個單元是一組可以單獨驗證的 commit。
 
-本計畫依 `pstack/skills/poteto-mode/playbooks/autopilot-stack.md` 執行。四個 PR 前後相依，使用者要在合併前審查。所有 PR 停在 merge-ready，由使用者由下往上合併。
+每個單元依 `pstack/skills/poteto-mode/playbooks/feature.md` 執行。單元前後相依，依序進行。四個單元都驗證完成後，以 `feat/agent-api` 開一個 PR 到 `main`，停在 merge-ready，由使用者合併。
 
 本 repo 在 Claude Code 中執行，不是 Cursor。下列對應在整份計畫中成立。`grok-4.6-fast-xhigh` 的 lane 由 Claude Code 的 `haiku` 子代理執行。`/goal` 是在 session 中釘住的計畫目標文字。30 分鐘稽核用 `/loop 30m`。live lane 的驗證面是 HTTP 與 MCP，每個 lane 存請求與回應的文字記錄檔（`.txt`），不存截圖。
 
@@ -23,41 +23,41 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 ### Arm the program
 
 - [ ] 向使用者說明本計畫與執行方式，然後停止。只有使用者明確同意後才開始執行。
-- [ ] 使用者同意後，以 `/goal` 釘住這段文字。「依 `docs/plans/agent-write-api.md` 依序完成 AGENT-1 到 AGENT-4。每個 PR 的 unit、live、perf 方塊都有證據才算驗證完成。PR 停在 merge-ready，由使用者合併。四個 PR 都 merge-ready 後結束。」
+- [ ] 使用者同意後，以 `/goal` 釘住這段文字。「依 `docs/plans/agent-write-api.md` 在 `feat/agent-api` 上依序完成 AGENT-1 到 AGENT-4。每個單元的 unit、live、perf 方塊都有證據才算驗證完成。四個單元都驗證後開一個 PR 到 `main`，停在 merge-ready，由使用者合併。」
 - [ ] 計畫開始時讀取下列檔案，每次稽核再讀一次。
   - [ ] `git show origin/main:tests/test_image.py`
   - [ ] `git show origin/main:Dockerfile`
-  - [ ] `git show docs/agent-write-research:docs/plans/agent-write-api.md`，以及同一分支的 `docs/research/mcp-spec-2026-09.md`、`docs/research/browser-auth-options.md`。
-  - [ ] 本機 plugin cache 中的 `poteto-mode/playbooks/autopilot-stack.md`、`poteto-mode/playbooks/opening-a-pr.md`、`swarm/SKILL.md`。
+  - [ ] `git show feat/agent-api:docs/plans/agent-write-api.md`，以及同一分支的 `docs/research/mcp-spec-2026-09.md`、`docs/research/browser-auth-options.md`。
+  - [ ] 本機 plugin cache 中的 `poteto-mode/playbooks/feature.md`、`poteto-mode/playbooks/opening-a-pr.md`、`swarm/SKILL.md`。
 - [ ] 以 `/loop 30m` 設定 30-minute 稽核週期，不靠記憶維持週期。
 - [ ] 稽核提示逐字使用這段。「Re-read the execution playbook from trunk and the armed /goal. Audit the operation against both and fix drift in this tick. Probe every active lane and judge progress by side effects only. Stand down a stuck lane and dispatch its replacement now. Then post a status message to the operator in chat, whether or not anything changed, with the queue table of PR, owner, state, and head SHA, the verdicts since the last tick, what merged, open operator gates, and blockers.」
 - [ ] 使用者要求暫停或停止時，立即要求每個 owner 停止所有寫入。
 
 ### Spawn owners
 
-- [ ] 每個 PR 派一個 `poteto-agent` owner，負責 execution playbook 列出的完整生命週期。owner 在自己的 git worktree 中工作。
-- [ ] 依這個相依圖執行。
-  - [ ] AGENT-1 最先做，從 `main` 開 `feat/agent-guard`。
-  - [ ] AGENT-2 在 AGENT-1 之後，以 `feat/agent-guard` 為 base 開 `feat/agent-write`。
-  - [ ] AGENT-3 在 AGENT-2 之後，以 `feat/agent-write` 為 base 開 `feat/agent-mcp`。
-  - [ ] AGENT-4 在 AGENT-3 之後，以 `feat/agent-mcp` 為 base 開 `feat/agent-skill`。
+- [ ] 每個單元派一個 `poteto-agent` owner。owner 在自己的 git worktree 中，從 `feat/agent-api` 的當前 tip 開工作分支，commit 後回報 head SHA，不 push、不開 PR。
+- [ ] 依這個相依圖執行。root 在單元判定乾淨後，把 `feat/agent-api` fast-forward 到該單元的 head，下一個單元才開始。
+  - [ ] AGENT-1 最先做，base 是 `4c2feba`。
+  - [ ] AGENT-2 在 AGENT-1 之後，base 是 AGENT-1 的 head。
+  - [ ] AGENT-3 在 AGENT-2 之後，base 是 AGENT-2 的 head。
+  - [ ] AGENT-4 在 AGENT-3 之後，base 是 AGENT-3 的 head。
 - [ ] 守住檔案邊界。AGENT-1 只改 `src/beancount_agent_api/{__init__,guard,serve}.py`、`pyproject.toml`、`uv.lock`、`Dockerfile`、`.dockerignore`、`docker-entrypoint.sh`、`tests/**`、`scripts/agent-api-lanes.sh`。AGENT-2 只改 `src/beancount_agent_api/{__init__,core,extension}.py`、`tests/**`、`scripts/agent-api-lanes.sh`。AGENT-3 只改 `src/beancount_agent_api/{extension,mcp}.py`、`tests/**`、`scripts/agent-api-lanes.sh`。AGENT-4 只改 `skills/**`、`docs/**`、`compose.example.yaml`。
-- [ ] 守住審查關卡。四個 PR 都不改使用者介面的操作方式，沒有 review gate。使用者仍在合併前審查整條 stack。
+- [ ] 守住審查關卡。四個單元都不改使用者介面的操作方式，沒有 review gate。使用者在合併前審查整個 PR。
 
 ### PR mechanics, for every PR
 
 - [ ] 決定一次 forge。預設用 `gh`。若 `command -v origin` 成功且 Origin 能解析此 repo，所有 PR 操作改用 `origin pr`。記錄任何退回 `gh` 的情況。不要求 `gt`。
-- [ ] PR 一律以 ready 開啟，不用 draft。用 `gh pr create --base <base-branch>`，stack 子 PR 以父分支為 base。
+- [ ] 只開一個 PR。四個單元都驗證後，push `feat/agent-api`，以 `gh pr create --base main` 開 ready PR，不用 draft。
 - [ ] PR 推送前執行一次 `uv run ruff check .` 與 `uv run ruff format --check .`。推送時保留 hooks。
 - [ ] 每次 commit 前執行 `/deslop`，送審前執行 `/no-comments`。
 - [ ] 依 `../references/bugbot-triage.md` 處理每一則 Bugbot 與安全審查留言。
-- [ ] babysit 前 rebase 到最新 trunk，回報 merge-ready 前再 rebase 一次。
+- [ ] 開 PR 前把 `feat/agent-api` rebase 到最新 `main`，回報 merge-ready 前再 rebase 一次。
 
 ### Verdict and merge, for every PR
 
 - [ ] 在 merge-ready 的 head SHA 上，依 `swarm/SKILL.md` 執行 swarm。一個 gates lane（ruff、pytest、hadolint、actionlint、pip-audit）。該 PR **Verify, live** 區塊的十個 live lane。**Verify, perf** 區塊的 perf lane。一個稽核 lane，讀 diff 與證據檔，不信任 PR 描述。
 - [ ] 每個 lane 都是 `PASS` 才算乾淨。發現的問題退回 owner。新的 head 要重跑 swarm，重新判定。
-- [ ] 乾淨判定後，把 PR 接到 stack 上，不合併。rebase 後依 `playbooks/shipping.md` 比對 `git patch-id`。patch-id 不變則保留判定，改變則重跑 swarm。
+- [ ] 乾淨判定後，root 把 `feat/agent-api` fast-forward 到該單元的 head，不合併到 `main`。rebase 後依 `playbooks/shipping.md` 比對每個單元的 `git patch-id`。patch-id 不變則保留判定，改變則重跑 swarm。
 
 ### Boot recipe, for every live lane
 
@@ -122,8 +122,8 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 
 - [ ] root 在該 head SHA 給出乾淨判定。
 - [ ] Bugbot 留言處理完畢。
-- [ ] 判定後 rebase 到最新 trunk，patch-id 不變。
-- [ ] root 把 PR 接到 stack 上，由使用者由下往上合併。
+- [ ] 判定後 rebase 到 `feat/agent-api` 的最新 tip，patch-id 不變。
+- [ ] root 把 `feat/agent-api` fast-forward 到該單元的 head。
 
 ## 以 fava extension 提供 REST 寫入端點 (AGENT-2)
 
@@ -178,8 +178,8 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 
 - [ ] root 在該 head SHA 給出乾淨判定。
 - [ ] Bugbot 留言處理完畢。
-- [ ] 判定後 rebase 到 AGENT-1 的最新 tip，patch-id 不變。
-- [ ] root 把 PR 接到 AGENT-1 之上，由使用者由下往上合併。
+- [ ] 判定後 rebase 到 `feat/agent-api` 的最新 tip，patch-id 不變。
+- [ ] root 把 `feat/agent-api` fast-forward 到該單元的 head。
 
 ## 在同一個 extension 加上 MCP 端點 (AGENT-3)
 
@@ -231,8 +231,8 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 
 - [ ] root 在該 head SHA 給出乾淨判定，合併前以 `interrogate/SKILL.md` 對 `mcp-spec-2026-09.md` 第 5.3 節的清單做一次對抗審查。
 - [ ] Bugbot 留言處理完畢。
-- [ ] 判定後 rebase 到 AGENT-2 的最新 tip，patch-id 不變。
-- [ ] root 把 PR 接到 AGENT-2 之上，由使用者由下往上合併。
+- [ ] 判定後 rebase 到 `feat/agent-api` 的最新 tip，patch-id 不變。
+- [ ] root 把 `feat/agent-api` fast-forward 到該單元的 head。
 
 ## 加入記帳 Skill、部署說明與研究筆記 (AGENT-4)
 
@@ -284,14 +284,14 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 
 - [ ] root 在該 head SHA 給出乾淨判定。
 - [ ] Bugbot 留言處理完畢。
-- [ ] 判定後 rebase 到 AGENT-3 的最新 tip，patch-id 不變。
-- [ ] root 把 PR 接到 AGENT-3 之上，由使用者由下往上合併。
+- [ ] 判定後 rebase 到 `feat/agent-api` 的最新 tip，patch-id 不變。
+- [ ] root 把 `feat/agent-api` fast-forward 到該單元的 head。
 
 ## Close the program
 
 - [ ] 上面每個方塊都有證據並已勾選。
 - [ ] 使用者完成部署。在 Unraid 產生 token 檔，設定 `AGENT_API_TOKEN_FILE`、`CF_ACCESS_TEAM_DOMAIN`、`CF_ACCESS_AUD`，更新 image，在 `main.beancount` 加入 extension 行，在 Claude Code 註冊 MCP。部署後區網瀏覽器直連 5656 會得到 401，瀏覽器改走 Cloudflare 網址。這些是使用者的操作，Agent 不代為執行。
-- [ ] 依 execution playbook 回報 stack 的 root 與 tip 連結、每個 PR 一行判定摘要，以及被擱置或排除的項目與原因。
+- [ ] 回報 PR 連結、每個單元一行判定摘要，以及被擱置或排除的項目與原因。
 
 ## Appendix A. Prototype evidence
 
