@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Live lanes and perf probe for the guard in docs/plans/agent-write-api.md (AGENT-1).
+# Live lanes and perf probes for docs/plans/agent-write-api.md (AGENT-1 guard, AGENT-2 writes).
 #
 #   images               build $HEAD_IMAGE from this checkout and $TRUNK_IMAGE from $TRUNK_REF
 #   boot <n> [target]    start a JWKS stub and fava for worker <n>; target is head or trunk
 #   jwt <n> <claims>     sign a JWT for worker <n>'s stub; optional key and kid follow
 #   down <n>             remove worker <n>'s containers and network
-#   lane <n>             run lane <n> against $TARGET (head by default) and save its transcript
+#   lane <n>             run guard lane <n> against $TARGET (head by default)
 #   perf-guard           interleave trunk and head, 20 rounds each
-#   all                  images, lanes 1-10, perf-guard
+#   all                  images, guard lanes 1-10, perf-guard
+#   write-lane <n>       run write-endpoint lane <n> against $TARGET (head by default)
+#   perf-write           interleave trunk and head home pages and head writes, 20 rounds each
+#   write-all            images, write lanes 1-10, perf-write
 #
 # Transcripts land in $LANES_OUT/worker-<n>/<slug>.txt (trunk runs: trunk-<slug>.txt).
 set -euo pipefail
@@ -166,7 +169,7 @@ request() {
     echo "\$ curl -X $method $(short "$@")http://127.0.0.1:<$target>$path"
     grep -iE '^(HTTP/|www-authenticate|location|content-type)' "$headers" | tr -d '\r' | sed 's/^/< /'
     echo "< body: $(wc -c <"$BODY") bytes, sha256 $(sha256sum "$BODY" | cut -c1-16)"
-    head -c 240 "$BODY" | tr -d '\r'
+    head -c 1200 "$BODY" | tr -d '\r'
     echo
   } >>"$TRANSCRIPT"
 }
@@ -425,6 +428,299 @@ cmd_perf_guard() {
   echo "perf-guard: $result  $TRANSCRIPT"
 }
 
+TXNS=txns/2026.beancount
+WRITE_PATH="/$BFILE/extension/AgentApi/transactions"
+DINNER_ENTRY='2026-09-24 ! ^ik-d1
+  Expenses:Food:Dinner                                  190 TWD
+  Assets:TW:Cash                                       -190 TWD'
+
+txns_file() { echo "$(idir "$1" "$2")/ledger/$TXNS"; }
+
+tree_sha() {
+  (cd "$(idir "$1" "$2")/ledger" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+}
+
+link_count() { grep -rhoE -- "\\^$3([^A-Za-z0-9_/.-]|\$)" "$(idir "$1" "$2")/ledger" | wc -l; }
+
+field() { jq -r "$1" "$BODY" 2>/dev/null || echo "<body is not JSON>"; }
+
+yes_no() { if "$@"; then echo yes; else echo no; fi; }
+
+post() {
+  local n=$1 target=$2 payload=$3
+  shift 3
+  note "request body: $payload"
+  request "$n" "$target" POST "$WRITE_PATH" -H 'Content-Type: application/json' \
+    --data-binary "$payload" "$@"
+}
+
+dinner() {
+  printf '{"date":"2026-09-24","source":"錢包","target":"晚餐","amount":"190","key":"%s"}' "$1"
+}
+
+wlane1() {
+  start_lane 1 lane1-regression
+  cmd_boot 1 trunk
+  cmd_boot 1 head
+  post 1 trunk "$(dinner d1)" -H "$(bearer 1)"
+  check "trunk has no write endpoint" "$STATUS" 404
+  post 1 head "$(dinner d1)" -H "$(bearer 1)"
+  check "head creates the entry" "$STATUS" 201
+  note "tail of $TXNS:"
+  tail -n 4 "$(txns_file 1 head)" >>"$TRANSCRIPT"
+  check "$TXNS is the fixture plus the expected entry, byte for byte" \
+    "$(yes_no cmp -s <(cat "$REPO/tests/fixtures/agent-ledger/$TXNS"; printf '\n%s\n' "$DINNER_ENTRY") \
+      "$(txns_file 1 head)")" yes
+  end_lane 1
+}
+
+wlane2() {
+  start_lane 2 lane2-browser-write
+  cmd_boot 2 "$TARGET"
+  post 2 "$TARGET" "$(dinner lane2)" -H "$(assertion "$(cmd_jwt 2)")"
+  check "write with a valid JWT" "$STATUS" 201
+  check "entry header keeps the ! flag" "$(field .entry | head -1)" "2026-09-24 ! ^ik-lane2"
+  check "file holds the ! entry once" \
+    "$(grep -cxF '2026-09-24 ! ^ik-lane2' "$(txns_file 2 "$TARGET")" || true)" 1
+  end_lane 2
+}
+
+wlane3() {
+  start_lane 3 lane3-alias
+  cmd_boot 3 "$TARGET"
+  local key accounts
+  for key in lane3-short lane3-full; do
+    local target=晚餐
+    [ "$key" = lane3-full ] && target=食物/晚餐
+    post 3 "$TARGET" "{\"date\":\"2026-09-24\",\"source\":\"錢包\",\"target\":\"$target\",\"amount\":\"190\",\"narration\":\"晚餐\",\"key\":\"$key\"}" \
+      -H "$(bearer 3)"
+    check "$target: status" "$STATUS" 201
+    accounts=$(field .entry | awk 'NR > 1 && NF { print $1 }' | paste -sd' ')
+    check "$target: posting accounts" "$accounts" "Expenses:Food:Dinner Assets:TW:Cash"
+    check "$target: entry is in the file" \
+      "$(grep -cxF "2026-09-24 ! \"晚餐\" ^ik-$key" "$(txns_file 3 "$TARGET")" || true)" 1
+  done
+  end_lane 3
+}
+
+wlane4() {
+  start_lane 4 lane4-ambiguous
+  cmd_boot 4 "$TARGET"
+  local before
+  before=$(tree_sha 4 "$TARGET")
+  post 4 "$TARGET" '{"date":"2026-09-24","source":"錢包","target":"午餐","amount":"120","key":"lane4"}' \
+    -H "$(bearer 4)"
+  check "ambiguous alias" "$STATUS" 422
+  check "error code" "$(field .error.code)" ambiguous_account
+  check "candidates" "$(field '.error.candidates | join(" ")')" "Expenses:Food:Lunch Expenses:Work:Lunch"
+  check "ledger unchanged" "$(tree_sha 4 "$TARGET")" "$before"
+  end_lane 4
+}
+
+wlane5() {
+  start_lane 5 lane5-invalid-account
+  cmd_boot 5 "$TARGET"
+  local before
+  before=$(tree_sha 5 "$TARGET")
+  post 5 "$TARGET" '{"date":"2026-09-24","source":"悠遊卡","target":"晚餐","amount":"190","key":"lane5-closed"}' \
+    -H "$(bearer 5)"
+  check "account closed on 2026-06-30: status" "$STATUS" 422
+  check "account closed on 2026-06-30: code" "$(field .error.code)" account_closed
+  post 5 "$TARGET" '{"date":"2025-12-31","source":"錢包","target":"晚餐","amount":"190","key":"lane5-early"}' \
+    -H "$(bearer 5)"
+  check "date before the 2026-01-01 open: status" "$STATUS" 422
+  check "date before the 2026-01-01 open: code" "$(field .error.code)" account_not_open
+  post 5 "$TARGET" '{"date":"2026-09-24","source":"Assets:錢包","target":"晚餐","amount":"190","key":"lane5-name"}' \
+    -H "$(bearer 5)"
+  check "Assets:錢包: status" "$STATUS" 422
+  check "Assets:錢包: code" "$(field .error.code)" invalid_account_name
+  check "ledger unchanged" "$(tree_sha 5 "$TARGET")" "$before"
+  end_lane 5
+}
+
+wlane6() {
+  start_lane 6 lane6-amount
+  cmd_boot 6 "$TARGET"
+  local before amount i=0
+  before=$(tree_sha 6 "$TARGET")
+  for amount in 190.5.1 '1 @ 2' -5 0.001; do
+    i=$((i + 1))
+    post 6 "$TARGET" "{\"date\":\"2026-09-24\",\"source\":\"錢包\",\"target\":\"晚餐\",\"amount\":\"$amount\",\"key\":\"lane6-$i\"}" \
+      -H "$(bearer 6)"
+    check "amount '$amount': status" "$STATUS" 422
+    check "amount '$amount': code" "$(field .error.code)" invalid_amount
+  done
+  check "ledger unchanged" "$(tree_sha 6 "$TARGET")" "$before"
+  end_lane 6
+}
+
+wlane7() {
+  start_lane 7 lane7-dry-run
+  cmd_boot 7 "$TARGET"
+  local before preview body
+  before=$(tree_sha 7 "$TARGET")
+  body=$(dinner lane7)
+  post 7 "$TARGET" "${body%\}},\"dry_run\":true}" -H "$(bearer 7)"
+  check "dry run: status" "$STATUS" 200
+  check "dry run: created" "$(field .created)" false
+  preview=$(field .entry)
+  check "dry run: ledger unchanged" "$(tree_sha 7 "$TARGET")" "$before"
+  post 7 "$TARGET" "$body" -H "$(bearer 7)"
+  check "real write: status" "$STATUS" 201
+  check "real write returns the dry-run entry" "$(field .entry)" "$preview"
+  check "file ends with the dry-run entry" \
+    "$(tail -n "$(wc -l <<<"$preview")" "$(txns_file 7 "$TARGET")")" "$preview"
+  end_lane 7
+}
+
+wlane8() {
+  start_lane 8 lane8-idempotent
+  cmd_boot 8 "$TARGET"
+  local w i url
+  w=$(wdir 8)
+  url="http://127.0.0.1:$(port 8 "$TARGET")$WRITE_PATH"
+  post 8 "$TARGET" "$(dinner lane8)" -H "$(bearer 8)"
+  check "first request" "$STATUS" 201
+  race() {
+    local key=$1
+    note "5 concurrent requests with key $key"
+    for i in 1 2 3 4 5; do
+      curl -sS -o "$w/race-$i.body" -w '%{http_code}\n' -X POST -H "$(bearer 8)" \
+        -H 'Content-Type: application/json' --data-binary "$(dinner "$key")" "$url" \
+        >"$w/race-$i.code" &
+    done
+    wait
+    for i in 1 2 3 4 5; do
+      note "< $(cat "$w/race-$i.code") $(jq -c '{created, link}' "$w/race-$i.body" 2>/dev/null)"
+    done
+  }
+  race lane8
+  local codes
+  codes=$(cat "$w"/race-*.code | sort | paste -sd' ')
+  check "concurrent retries" "$codes" "200 200 200 200 200"
+  check "concurrent retries: created" \
+    "$(jq -r .created "$w"/race-*.body 2>/dev/null | sort -u | paste -sd' ')" false
+  check "^ik-lane8 occurrences in the ledger" "$(link_count 8 "$TARGET" ik-lane8)" 1
+  race lane8-cold
+  codes=$(cat "$w"/race-*.code | sort | paste -sd' ')
+  check "concurrent first writes" "$codes" "200 200 200 200 201"
+  check "^ik-lane8-cold occurrences in the ledger" "$(link_count 8 "$TARGET" ik-lane8-cold)" 1
+  end_lane 8
+}
+
+wlane9() {
+  start_lane 9 lane9-time
+  cmd_boot 9 "$TARGET"
+  local row
+  post 9 "$TARGET" '{"time":"2026-09-25T07:00:00+08:00","source":"錢包","target":"晚餐","amount":"80","key":"lane9"}' \
+    -H "$(bearer 9)"
+  check "write with time" "$STATUS" 201
+  check "entry header" "$(field .entry | head -1)" "2026-09-25 ! ^ik-lane9"
+  check "time metadata" "$(field .entry | sed -n 2p)" '  time: "07:00:00"'
+  check "file holds the entry" \
+    "$(grep -cxF '2026-09-25 ! ^ik-lane9' "$(txns_file 9 "$TARGET")" || true)" 1
+  request 9 "$TARGET" GET "/$BFILE/api/query" -H "$(bearer 9)" -G --data-urlencode \
+    'query_string=SELECT date, flag, links, account, position WHERE date >= 2026-09-24 AND date <= 2026-09-25'
+  check "query" "$STATUS" 200
+  row=$(jq -c '.data.rows[]' "$BODY" 2>/dev/null | grep -F ik-lane9 | head -1 || true)
+  note "row: $row"
+  check "query row dated 2026-09-25" "$(yes_no grep -qF '2026-09-25' <<<"$row")" yes
+  end_lane 9
+}
+
+wlane10() {
+  start_lane 10 lane10-errors
+  cmd_boot 10 "$TARGET"
+  local boot
+  request 10 "$TARGET" GET "/$BFILE/api/errors" -H "$(bearer 10)"
+  boot=$(field '.data | length')
+  note "errors at boot: $boot"
+  local body
+  for body in "$(dinner lane10-a)" \
+    '{"time":"2026-09-25T07:00:00+08:00","source":"錢包","target":"晚餐","amount":"80","key":"lane10-b"}' \
+    '{"date":"2026-09-24","source":"Assets:TW:Cash","target":"食物/晚餐","amount":"12.50","narration":"晚餐 \"加蛋\"","key":"lane10-c"}'; do
+    post 10 "$TARGET" "$body" -H "$(bearer 10)"
+    check "write" "$STATUS" 201
+    check "errors reported before and after the write" "$(field '"\(.errors.before) \(.errors.after)"')" "$boot $boot"
+  done
+  post 10 "$TARGET" "$(dinner lane10-d)" -H "$(assertion "$(cmd_jwt 10)")"
+  check "browser write" "$STATUS" 201
+  post 10 "$TARGET" "$(dinner lane10-a)" -H "$(bearer 10)"
+  check "retry" "$STATUS" 200
+  body=$(dinner lane10-e)
+  post 10 "$TARGET" "${body%\}},\"dry_run\":true}" -H "$(bearer 10)"
+  check "dry run" "$STATUS" 200
+  post 10 "$TARGET" '{"date":"2026-09-24","source":"錢包","target":"午餐","amount":"120","key":"lane10-f"}' \
+    -H "$(bearer 10)"
+  check "ambiguous" "$STATUS" 422
+  request 10 "$TARGET" GET "/$BFILE/api/errors" -H "$(bearer 10)"
+  check "errors after all writes equal errors at boot" "$(field '.data | length')" "$boot"
+  end_lane 10
+}
+
+p95() { sort -n | awk '{a[NR]=$1} END {i = int(NR * 0.95); if (i < NR * 0.95) i++; print a[i]}'; }
+
+cmd_perf_write() {
+  local n=perf rounds=20 jwt i w home_trunk home_head write_url
+  w=$(wdir $n)
+  TRANSCRIPT="$w/perf-write.txt"
+  cmd_down $n
+  rm -rf "$w"
+  mkdir -p "$w"
+  cmd_boot $n trunk
+  cmd_boot $n head
+  jwt=$(cmd_jwt $n)
+  home_trunk="http://127.0.0.1:$(port $n trunk)/"
+  home_head="http://127.0.0.1:$(port $n head)/"
+  write_url="http://127.0.0.1:$(port $n head)$WRITE_PATH"
+  perf_post() {
+    curl -sS -o /dev/null -w "%{http_code} %{time_total}\n" -X POST -H "$(bearer $n)" \
+      -H 'Content-Type: application/json' --data-binary "$(dinner "$1")" "$write_url"
+  }
+  for i in 1 2 3; do
+    curl -fsS -L -o /dev/null -H "$(assertion "$jwt")" "$home_trunk"
+    curl -fsS -L -o /dev/null -H "$(assertion "$jwt")" "$home_head"
+    perf_post "perf-warm-$i" >/dev/null
+  done
+  : >"$w/trunk-home.times"
+  : >"$w/head-home.times"
+  : >"$w/head-write.raw"
+  for ((i = 1; i <= rounds; i++)); do
+    curl -fsS -L -o /dev/null -w '%{time_total}\n' -H "$(assertion "$jwt")" "$home_trunk" \
+      >>"$w/trunk-home.times"
+    curl -fsS -L -o /dev/null -w '%{time_total}\n' -H "$(assertion "$jwt")" "$home_head" \
+      >>"$w/head-home.times"
+    perf_post "perf-$i" >>"$w/head-write.raw"
+  done
+  cut -d' ' -f2 "$w/head-write.raw" >"$w/head-write.times"
+  local trunk_median head_median write_p95 write_codes result
+  trunk_median=$(median <"$w/trunk-home.times")
+  head_median=$(median <"$w/head-home.times")
+  write_p95=$(p95 <"$w/head-write.times")
+  write_codes=$(cut -d' ' -f1 "$w/head-write.raw" | sort -u | paste -sd' ')
+  result=$(awk -v h="$head_median" -v t="$trunk_median" -v p="$write_p95" -v c="$write_codes" \
+    'BEGIN {print (h <= 1.10 * t && p <= 0.300 && c == "201") ? "PASS" : "FAIL"}')
+  {
+    echo "# perf-write: GET / (following the redirect) with a JWT on trunk and head;"
+    echo "# POST $WRITE_PATH with the token on head, a new key each round"
+    echo "# trunk image $(docker image inspect --format '{{.Id}}' "$TRUNK_IMAGE")"
+    echo "# head image  $(docker image inspect --format '{{.Id}}' "$HEAD_IMAGE")"
+    echo "# 3 warm-up rounds, then $rounds interleaved rounds; seconds from curl time_total"
+    echo "# columns: trunk-home head-home head-write-status head-write"
+    paste -d' ' "$w/trunk-home.times" "$w/head-home.times" "$w/head-write.raw" |
+      nl -w2 -s' ' | sed 's/^/round /'
+    echo "trunk home median: $trunk_median s"
+    echo "head home median:  $head_median s"
+    echo "ratio head/trunk:  $(awk -v h="$head_median" -v t="$trunk_median" 'BEGIN {printf "%.3f", h / t}')"
+    echo "head write median: $(median <"$w/head-write.times") s"
+    echo "head write p95:    $write_p95 s"
+    echo "head write statuses: $write_codes"
+    echo "RESULT: $result (head home median <= 1.10 x trunk; write p95 <= 0.300 s; every write 201)"
+  } >"$TRANSCRIPT"
+  cmd_down $n
+  echo "perf-write: $result  $TRANSCRIPT"
+}
+
 cmd_images() {
   docker build -q -t "$HEAD_IMAGE" "$REPO" >/dev/null
   git -C "$REPO" archive "$TRUNK_REF" | docker build -q -t "$TRUNK_IMAGE" - >/dev/null
@@ -444,8 +740,15 @@ all)
   for n in 1 2 3 4 5 6 7 8 9 10; do "lane$n"; done
   cmd_perf_guard
   ;;
+write-lane) "wlane$2" ;;
+perf-write) cmd_perf_write ;;
+write-all)
+  cmd_images
+  for n in 1 2 3 4 5 6 7 8 9 10; do "wlane$n"; done
+  cmd_perf_write
+  ;;
 *)
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
   ;;
 esac
