@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -307,6 +308,67 @@ def test_refuses_to_start_without_credentials(image: str, ledger_volume: str) ->
         "beancount-fava-serve: no credential is configured: set AGENT_API_TOKEN_FILE for "
         "agents, or CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD for browsers behind Cloudflare Access"
     )
+
+
+def test_documented_setup_loads_the_extension(image: str, tmp_path: Path) -> None:
+    doc = (REPO / "docs" / "agent-api.md").read_text(encoding="utf-8")
+    extension_line = next(
+        line for line in doc.splitlines() if line.startswith('2020-01-01 custom "fava-extension"')
+    )
+    rendered = docker(
+        "compose", "-f", str(REPO / "compose.example.yaml"), "config", "--format", "json",
+        check=True,
+    )  # fmt: skip
+    service = json.loads(rendered.stdout)["services"]["fava"]
+    environment = service["environment"]
+    token_target = next(
+        volume["target"]
+        for volume in service["volumes"]
+        if volume["source"].endswith("agent-token")
+    )
+    assert environment["AGENT_API_TOKEN_FILE"] == token_target
+
+    ledger = tmp_path / "ledger"
+    shutil.copytree(REPO / "tests" / "fixtures" / "agent-ledger", ledger)
+    main = ledger / "main.beancount"
+    lines = main.read_text(encoding="utf-8").splitlines()
+    lines = [line for line in lines if "fava-extension" not in line] + [extension_line]
+    main.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    token = tmp_path / "compose-token"
+    token.write_text("compose-token\n")
+    token.chmod(0o644)
+
+    options = [
+        option for name, value in environment.items() for option in ("-e", f"{name}={value}")
+    ]
+    with (
+        ledger_volume_of(image, ledger) as volume,
+        running_fava(
+            image, volume, environment["BEANCOUNT_FILE"], tmp_path,
+            "-v", f"{token}:{token_target}:ro", *options,
+        ) as (_, port),
+    ):  # fmt: skip
+        headers = {"Authorization": "Bearer compose-token"}
+        errors = urllib.request.Request(
+            f"http://127.0.0.1:{port}/agent/api/errors", headers=headers
+        )
+        with urllib.request.urlopen(errors, timeout=10) as response:
+            assert json.loads(response.read())["data"] == []
+
+        body = {"date": "2026-09-24", "source": "錢包", "target": "晚餐", "amount": "190"}
+        add = urllib.request.Request(
+            f"http://127.0.0.1:{port}/agent/extension/AgentApi/transactions",
+            data=json.dumps(body | {"key": "doc", "dry_run": True}).encode(),
+            headers=headers | {"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(add, timeout=10) as response:
+            assert response.status == 200
+            assert json.loads(response.read())["entry"] == (
+                "2026-09-24 ! ^ik-doc\n"
+                "  Expenses:Food:Dinner                                  190 TWD\n"
+                "  Assets:TW:Cash                                       -190 TWD\n"
+            )
 
 
 def test_stops_on_sigterm(fava_port: tuple[str, int]) -> None:
