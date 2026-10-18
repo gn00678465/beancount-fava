@@ -710,9 +710,9 @@ class Background:
     A ThreadPoolExecutor joins its threads on exit and at interpreter shutdown, so a stuck
     work would hang the run past any result() timeout. A daemon thread holds up neither.
 
-    A work outlives its test only after result() has failed that test. If it resumes later, it
-    runs through the class patches of later tests, so failures after the first one in such a
-    run can be consequences of it.
+    Every passing path joins its works, so a work that outlives its test means that test has
+    already failed. If the work resumes later, it runs through the class patches of later
+    tests, so failures after the first one in such a run can be consequences of it.
     """
 
     def __init__(self, work: Callable[[], Any]) -> None:
