@@ -86,7 +86,13 @@ class AgentApi(FavaExtensionBase):
 
     def _approve(self, items: list[ApproveItem]) -> Response:
         ledger = self.ledger
-        loaded = self._load_files()
+        try:
+            loaded = self._load_files()
+        except OSError as error:
+            unreadable = Rejection(
+                "", "busy", f"A ledger file could not be read ({error}); no item was processed."
+            )
+            return _error(unreadable, 503)
         if loaded is None:
             busy = Rejection("", "busy", "The ledger files kept changing; retry the request.")
             return _error(busy, 503)
@@ -96,6 +102,7 @@ class AgentApi(FavaExtensionBase):
         # repeated id or key then sees the approved entry.
         current = {hash_entry(e): e for e in entries if isinstance(e, Transaction)}
         results = []
+        approved_at: dict[int, tuple[str, int]] = {}
         for item in items:
             result: dict[str, object] = {"id": item.id, "key": item.key}
             entry = current.get(item.id)
@@ -120,15 +127,56 @@ class AgentApi(FavaExtensionBase):
                     approved = entry._replace(flag="*")
                     del current[item.id]
                     current[hash_entry(approved)] = approved
-                    result.update(result="approved", new_id=hash_entry(approved))
+                    result.update(result="approved", new_id=None)
+                    approved_at[len(results)] = (entry.meta["filename"], entry.meta["lineno"])
                 else:
                     result["result"] = outcome
                     if message is not None:
                         result["message"] = message
             results.append(result)
+        if approved_at:
+            new_ids = self._approved_ids(files, set(approved_at.values()))
+            for index, place in approved_at.items():
+                results[index]["new_id"] = new_ids.get(place)
+        reload_error = None
         if any(result["result"] in ("approved", "error") for result in results):
-            ledger.changed()
-        return _json({"results": results, "ledger_errors": len(ledger.errors)}, 200)
+            try:
+                ledger.changed()
+            except OSError as error:
+                # fava's watcher may have marked the change as seen before the load failed.
+                reload_error = (
+                    f"fava could not reload the ledger ({error}); fava may show the ledger "
+                    "from before this request until a ledger file changes again or fava "
+                    "restarts."
+                )
+        ledger_errors = None if reload_error else len(ledger.errors)
+        body = {"results": results, "ledger_errors": ledger_errors, "reload_error": reload_error}
+        return _json(body, 200)
+
+    def _approved_ids(
+        self, written: dict[str, bytes], places: set[tuple[str, int]]
+    ) -> dict[tuple[str, int], str]:
+        """The id of each approved entry, from a load of the files as this request wrote them.
+
+        A plugin can derive data from the flag, so the id comes from a real load, not from
+        the entry with its flag replaced. A place is left out when its file no longer holds
+        what this request wrote, or when it does not hold exactly one transaction.
+        """
+        try:
+            loaded = self._load_files()
+        except OSError:
+            return {}
+        if loaded is None:
+            return {}
+        entries, files = loaded
+        same = {path for path, data in files.items() if written.get(path) == data}
+        found: dict[tuple[str, int], list[Transaction]] = {}
+        for entry in entries:
+            if isinstance(entry, Transaction):
+                place = (entry.meta["filename"], entry.meta["lineno"])
+                if place in places and place[0] in same:
+                    found.setdefault(place, []).append(entry)
+        return {place: hash_entry(txns[0]) for place, txns in found.items() if len(txns) == 1}
 
     def _load_files(self) -> tuple[list[Directive], dict[str, bytes]] | None:
         """Load the ledger from its files, with the bytes that load parsed.

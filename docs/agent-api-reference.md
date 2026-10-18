@@ -286,14 +286,14 @@ fava 在處理 extension 的請求之前會檢查 ledger 檔有沒有改變，�
 {"results": [
   {"id": "d362d2af421e7328385e5f90dc63e49a", "key": "web-123", "result": "approved", "new_id": "b529ca49a1c3aab4a1cb65c3b7c0225a"},
   {"id": "77aa0000000000000000000000000000", "key": null, "result": "stale"}
-], "ledger_errors": 0}
+], "ledger_errors": 0, "reload_error": null}
 ```
 
 `results` 的順序與請求相同，每筆帶回請求的 `id` 與 `key`。一筆失敗不影響其他筆。
 
 | `result` | 意思 |
 |---|---|
-| `approved` | 已從 `!` 改成 `*`，並已讀回確認。`new_id` 是核准後的 `id`。 |
+| `approved` | 已從 `!` 改成 `*`，並已讀回確認。`new_id` 是核准後的 `id`，取自寫入後再載入一次的帳本，所以 plugin 依 flag 改變的資料也算在內。那次載入對不上這次寫入的內容時（例如檔案在寫入後又被改過），`new_id` 是 `null`，重新讀取 `POST spending` 取得 `id`。 |
 | `already` | 那筆交易已是 `*`：以 `id` 找到的交易已是 `*`，或 `id` 找不到但以 `key` 找到的交易已是 `*`。 |
 | `stale` | 帳本上沒有使用者看到的那個版本，沒有寫入。可能是 `id` 找不到又沒有 `key`、以 `key` 找到的交易仍是 `!` 但內容或位置已改變，或檔案在核准讀取之後、寫入之前被改過。重新讀取 `POST spending`，再讓使用者決定。 |
 | `not_found` | `id` 找不到，以 `key` 也找不到交易。 |
@@ -317,7 +317,7 @@ flowchart TD
     Valid -->|是| Lock{"10 秒內取得寫入鎖？"}
     Lock -->|否| R503["503 busy"]
     Lock -->|是| Load{"載入帳本，載入前後<br>檔案都沒有改變？"}
-    Load -->|試 3 次都不同| R503
+    Load -->|試 3 次都不同，<br>或讀不到檔案| R503
     Load -->|是| Each["依序處理每一筆"]
     Each --> ById{"以 id 找到？"}
     ById -->|否，沒有 key| Stale["stale"]
@@ -334,6 +334,7 @@ flowchart TD
     Write --> Back{"讀回是預期的內容？"}
     Back -->|是| Approved["approved"]
     Back -->|否，或 I/O 錯誤| Error["error"]
+    Approved --> NewId["全部處理完後再載入一次，<br>取得 new_id"]
 ```
 
 核准不使用 fava 記憶體中的帳本，因為另一個請求正在重新載入時，那份帳本可能還是舊的（見 `POST spending`）。核准在寫入鎖內自己載入一次帳本，並在載入前後各讀一次所有檔案的位元組，以及 inode、大小、mtime 與 ctime。兩次全部相同，這次載入的交易才對應到磁碟上的內容；否則重試，最多 3 次。
@@ -342,7 +343,7 @@ flowchart TD
 
 `id` 是 fava 的 entry hash，涵蓋交易的全部內容，包含 metadata、tag、link、cost、price、檔名與行號。只有使用者看到的那個版本會符合。內容改過，或同一位置換成了另一筆相似的交易，都回 `stale`。
 
-寫入時只改 flag 那一個位元組。檔案的其他位元組都不變，包括換行字元（LF 或 CRLF）與檔尾有沒有換行。檔案的 inode、擁有者與權限也不變。寫入後再以路徑讀回整個檔案，確認只有那一個位元組改變。全部處理完後重新載入一次 fava 的 ledger。
+寫入時只改 flag 那一個位元組。檔案的其他位元組都不變，包括換行字元（LF 或 CRLF）與檔尾有沒有換行。檔案的 inode、擁有者與權限也不變。寫入後再以路徑讀回整個檔案，確認只有那一個位元組改變。全部處理完後，核准自己再載入一次帳本，取得每一筆核准後的 `new_id`，再重新載入 fava 的 ledger。所以有寫入的請求會完整載入帳本兩次，帳本越大越久，這段時間其他新增與核准要等寫入鎖。
 
 ### 與其他寫入者的同步
 
@@ -359,9 +360,9 @@ flowchart TD
 
 | 狀態 | body | 意思 |
 |---|---|---|
-| 200 | `{"results", "ledger_errors"}` | 每一筆的結果。`ledger_errors` 是處理完後 fava 的帳本錯誤數量。 |
+| 200 | `{"results", "ledger_errors", "reload_error"}` | 每一筆的結果。`ledger_errors` 是處理完後 fava 的帳本錯誤數量。`reload_error` 平時是 `null`。處理完後 fava 重新載入失敗時，`reload_error` 是說明文字，`ledger_errors` 是 `null`；`results` 仍是實際結果，已寫入的筆照樣回 `approved`。這時 fava 可能繼續顯示這次請求之前的帳本，直到帳本檔案再次變更或 fava 重新啟動。 |
 | 422 | `{"error": {...}}` | 請求不符合規則。`error` 的格式同 `POST transactions`，`code` 見下表。 |
-| 503 | `{"error": {...}}` | `code` 是 `busy`。另一筆寫入還沒完成，或載入帳本時檔案一直在改變。以同樣的 body 重送。 |
+| 503 | `{"error": {...}}` | `code` 是 `busy`，一筆都沒有處理。原因可能是另一筆寫入還沒完成、載入帳本時檔案一直在改變，或讀不到某個帳本檔案（例如沒有讀取權限）。讀不到檔案時，`message` 寫出是哪個檔案，修好之後再重送。其他情況以同樣的 body 重送。 |
 
 | 422 的 `code` | `field` | 原因 |
 |---|---|---|
