@@ -1589,6 +1589,80 @@ def test_approve_processes_nothing_when_a_file_cannot_be_read(
     assert spending_app.txns.read_bytes() == before
 
 
+OTHER_FILE_ENTRY = (
+    '\n2026-10-05 ! "主檔" "主檔中的待核准"\n  Expenses:Food:Dinner  2 TWD\n  Assets:TW:Cash\n'
+)
+
+
+def with_entry_in_main(app: SpendingApp) -> tuple[Path, list[dict[str, str]]]:
+    """Adds a pending entry to main.beancount; returns it and an item for each file."""
+    main = app.txns.with_name("main.beancount")
+    with main.open("a", encoding="utf-8") as file:
+        file.write(OTHER_FILE_ENTRY)
+    ids = pending_ids(app, "2026-10-05")
+    return main, [{"id": ids["採買與晚餐"], "key": "web-123"}, {"id": ids["主檔中的待核准"]}]
+
+
+def delete_after_fava_reload(
+    monkeypatch: Any, path: Path, edit: Callable[[], None] = lambda: None
+) -> None:
+    parse = extension.parse_approve_request
+
+    def parse_then_delete(raw: object) -> Any:
+        # After fava's own reload for this request, before approve reads the files.
+        edit()
+        path.unlink()
+        return parse(raw)
+
+    monkeypatch.setattr(extension, "parse_approve_request", parse_then_delete)
+
+
+@pytest.mark.parametrize("missing", ["main", "include"])
+def test_approve_processes_nothing_when_a_declared_file_is_missing(
+    spending_app: SpendingApp, monkeypatch: Any, missing: str
+) -> None:
+    main, items = with_entry_in_main(spending_app)
+    gone, kept = (main, spending_app.txns) if missing == "main" else (spending_app.txns, main)
+    before = kept.read_bytes()
+
+    delete_after_fava_reload(monkeypatch, gone)
+    status, body = approve(spending_app, {"items": items})
+
+    assert (status, body["error"]["code"]) == (503, "ledger_unreadable")
+    assert gone.name in body["error"]["message"]
+    assert kept.read_bytes() == before
+
+
+def test_approve_loads_a_ledger_whose_include_was_removed(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    main, items = with_entry_in_main(spending_app)
+
+    def drop_include() -> None:
+        main.write_text(
+            main.read_text(encoding="utf-8").replace('include "txns.beancount"', ""),
+            encoding="utf-8",
+        )
+
+    delete_after_fava_reload(monkeypatch, spending_app.txns, drop_include)
+    status, body = approve(spending_app, {"items": items})
+
+    assert (status, [item["result"] for item in body["results"]]) == (
+        200,
+        ["not_found", "approved"],
+    )
+    assert '2026-10-05 * "主檔" "主檔中的待核准"' in main.read_text(encoding="utf-8")
+
+
+def test_approve_loads_a_ledger_with_other_load_errors(spending_app: SpendingApp) -> None:
+    main = spending_app.txns.with_name("main.beancount")
+    with main.open("a", encoding="utf-8") as file:
+        file.write('\nplugin "no_such_plugin_for_tests"\n')
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"], body["ledger_errors"]) == (200, "approved", 1)
+
+
 def test_approve_reports_a_failed_reload(spending_app: SpendingApp, monkeypatch: Any) -> None:
     id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
     approve_ = extension.AgentApi._approve

@@ -318,7 +318,7 @@ flowchart TD
     Lock -->|否| R503["503 busy"]
     Lock -->|是| Load{"載入帳本，載入前後<br>檔案都沒有改變？"}
     Load -->|試 3 次都不同| R503
-    Load -->|讀不到檔案| Unreadable["503 ledger_unreadable"]
+    Load -->|讀不到檔案，<br>或宣告的檔案不存在| Unreadable["503 ledger_unreadable"]
     Load -->|是| Each["依序處理每一筆"]
     Each --> ById{"以 id 找到？"}
     ById -->|否，沒有 key| Stale["stale"]
@@ -363,7 +363,7 @@ flowchart TD
 |---|---|---|
 | 200 | `{"results", "ledger_errors", "reload_error"}` | 每一筆的結果。`ledger_errors` 是處理完後 fava 的帳本錯誤數量。`reload_error` 平時是 `null`。處理完後 fava 重新載入失敗時，`reload_error` 是說明文字，`ledger_errors` 是 `null`；`results` 仍是實際結果，已寫入的筆照樣回 `approved`。這時 fava 可能繼續顯示這次請求之前的帳本，直到帳本檔案再次變更或 fava 重新啟動。 |
 | 422 | `{"error": {...}}` | 請求不符合規則。`error` 的格式同 `POST transactions`，`code` 見下表。 |
-| 503 | `{"error": {...}}` | 一筆都沒有處理。`code` 是 `busy` 時，另一筆寫入還沒完成，或載入帳本時檔案一直在改變，以同樣的 body 重送。`code` 是 `ledger_unreadable` 時，讀不到某個帳本檔案（例如沒有讀取權限），`message` 寫出是哪個檔案；網頁可以顯示「帳本讀不到」，修好檔案後再重送。 |
+| 503 | `{"error": {...}}` | 一筆都沒有處理。`code` 是 `busy` 時，另一筆寫入還沒完成，或載入帳本時檔案一直在改變，以同樣的 body 重送。`code` 是 `ledger_unreadable` 時，讀不到某個帳本檔案，`message` 寫出是哪個檔案或哪個 `include`；網頁可以顯示「帳本讀不到」，修好檔案後再重送。讀不到包括：沒有讀取權限、主檔不存在、主檔仍有 `include` 宣告但檔案不存在（也包括 glob 沒有對應任何檔案）。已從主檔移除 `include` 宣告的檔案不算，核准照新的帳本處理。 |
 
 | 422 的 `code` | `field` | 原因 |
 |---|---|---|

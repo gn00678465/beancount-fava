@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import datetime
+import errno
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from beancount.core.data import Directive, Transaction
+from beancount.loader import LoadError
 from fava.beans.funcs import hash_entry
 from fava.beans.load import load_uncached
 from fava.ext import FavaExtensionBase, extension_endpoint
@@ -35,6 +38,8 @@ log = logging.getLogger(__name__)
 TZ = ZoneInfo("Asia/Taipei")
 LOCK_TIMEOUT = 10
 LOAD_ATTEMPTS = 3
+# beancount's loader reports a missing main file or include as an error and loads the rest.
+MISSING_FILE_RE = re.compile(r'File (glob )?".*" (does not exist|does not match any files)')
 
 # fava's FileModule lock covers only the file write. The link lookup and the insert must share
 # one critical section, or two requests with the same key both miss the link and both write.
@@ -188,11 +193,24 @@ class AgentApi(FavaExtensionBase):
         and change back during the load. Any write moves the file's ctime, so an unchanged
         inode, size, mtime, and ctime as well rule that out, as far as the file system's
         timestamps resolve two writes.
+
+        Raises OSError when a file cannot be read, or when the ledger still declares a file
+        that does not exist. A file whose include was removed is simply no longer loaded.
         """
         paths = list(self.ledger.options["include"])
         for _ in range(LOAD_ATTEMPTS):
             before = _read_files(paths)
-            entries, _, options = load_uncached(self.ledger.beancount_file_path, is_encrypted=False)
+            entries, errors, options = load_uncached(
+                self.ledger.beancount_file_path, is_encrypted=False
+            )
+            missing = [
+                error.message
+                for error in errors
+                if isinstance(error, LoadError) and MISSING_FILE_RE.fullmatch(error.message)
+            ]
+            if missing:
+                # The loaded entries lack a whole file, so no id or key lookup can be trusted.
+                raise FileNotFoundError(errno.ENOENT, "; ".join(missing))
             paths = list(options["include"])
             after = _read_files(paths)
             if before is not None and before == after:
