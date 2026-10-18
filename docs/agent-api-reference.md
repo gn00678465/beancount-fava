@@ -232,7 +232,7 @@ fava 寫入前不檢查整本帳。201 的 `errors` 是寫入前後 fava 的錯�
 | 欄位 | 說明 |
 |---|---|
 | `transactions` | 那天有費用 posting 的交易，依帳本順序。只在資產與負債之間轉帳的交易不列出。費用帳戶是根名稱等於 `option "name_expenses"`（預設 `Expenses`）的帳戶。 |
-| `id` | fava 的 entry hash，可以傳給 `GET /<bfile>/api/source_slice?entry_hash=<id>`。只代表這個版本：交易的任何文字改變（包含核准時 flag 從 `!` 改成 `*`）後，`id` 也會改變。跨次對應同一筆交易用 `key`。 |
+| `id` | fava 的 entry hash，可以傳給 `GET /<bfile>/api/source_slice?entry_hash=<id>`。只代表這個版本：交易的任何文字改變（包含核准時 flag 從 `!` 改成 `*`），或交易所在的檔名或行號改變（例如同一檔案中它前面多了一行）後，`id` 也會改變。跨次對應同一筆交易用 `key`。 |
 | `payee` | 沒有 payee 時是 `null`。 |
 | `key` | link `^ik-<key>` 去掉 `ik-` 的部分。沒有這種 link 時是 `null`。 |
 | `expenses` | 費用 posting，依帳本順序。 |
