@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import fava.core  # noqa: F401  # fava.beans.str raises a circular ImportError unless fava.core loads first
@@ -15,9 +16,12 @@ from fava.beans.str import to_string
 from beancount_agent_api.core import (
     Accounts,
     AddRequest,
+    ApproveItem,
     Rejection,
+    approved_slice,
     build_transaction,
     parse_add_request,
+    parse_approve_request,
     parse_spending_request,
     spending,
 )
@@ -465,3 +469,51 @@ def test_spending_key_is_the_first_ik_link_by_name() -> None:
     )
     [listed] = spending([txn], [], "Expenses", datetime.date(2026, 10, 5))["transactions"]
     assert listed["key"] == "a"
+
+
+def test_parse_approve_request() -> None:
+    assert parse_approve_request(
+        {"items": [{"id": "a", "key": "k"}, {"id": "b", "key": None}, {"id": "c"}]}
+    ) == [ApproveItem("a", "k"), ApproveItem("b", None), ApproveItem("c", None)]
+    assert parse_approve_request({"items": []}) == []
+
+
+PENDING = (
+    '2026-10-05 ! "店 ! 家" "! 注意" #a ^ik-k\n'
+    '  note: "x ! y"\n'
+    "  Expenses:Food:Dinner                                  150 TWD\n"
+    "  Assets:TW:Cash"
+)
+
+
+def pending_entry(source: str = PENDING) -> Any:
+    entries, errors, _ = loader.load_string(
+        "2026-01-01 open Expenses:Food:Dinner\n2026-01-01 open Assets:TW:Cash\n" + source
+    )
+    assert errors == []
+    return entries[-1]
+
+
+def test_approved_slice_changes_only_the_header_flag() -> None:
+    assert approved_slice(PENDING, pending_entry()) == PENDING.replace(" ! ", " * ", 1)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        PENDING.replace("150 TWD", "160 TWD"),
+        PENDING.replace("Assets:TW:Cash", "Assets:TW:Bank"),
+        PENDING.replace("! 注意", "注意"),
+        PENDING.replace("2026-10-05", "2026-10-06"),
+        PENDING.replace(" ! ", " * ", 1),
+        PENDING + "\n  Assets:TW:Bank  0 TWD",
+        "2026-10-05 ! oops",
+    ],
+)
+def test_approved_slice_refuses_other_lines(source: str) -> None:
+    assert approved_slice(source, pending_entry()) is None
+
+
+def test_approved_slice_allows_pushed_tags() -> None:
+    entry = pending_entry("pushtag #trip\n" + PENDING + "\npoptag #trip")
+    assert approved_slice(PENDING, entry) == PENDING.replace(" ! ", " * ", 1)

@@ -34,3 +34,16 @@
 2026-11-01 * "下個月"
   Expenses:Food:Dinner                                  999 TWD
   Assets:TW:Cash
+
+2026-08-10 ! "小明" "代墊午餐" #reimburse ^ik-lunch
+  note: "還代墊"
+  Expenses:Food:Dinner                                  120 TWD
+  Assets:TW:Cash
+
+2026-08-11 ! "停車"
+  Expenses:Daily:Groceries                               40 TWD
+  Assets:TW:Cash
+
+2026-08-12 P "待查" ^ik-odd
+  Expenses:Daily:Groceries                               10 TWD
+  Assets:TW:Cash

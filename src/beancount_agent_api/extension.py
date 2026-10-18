@@ -6,15 +6,21 @@ from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from beancount.core.data import Directive, Transaction
+from fava.beans.funcs import hash_entry
+from fava.core.file import get_entry_slice
 from fava.ext import FavaExtensionBase, extension_endpoint
+from fava.helpers import FavaAPIError
 from flask import Response, jsonify, request
 
 from beancount_agent_api import mcp
 from beancount_agent_api.core import (
     Accounts,
+    ApproveItem,
     Rejection,
+    approved_slice,
     build_transaction,
     parse_add_request,
+    parse_approve_request,
     parse_spending_request,
     spending,
 )
@@ -59,6 +65,68 @@ class AgentApi(FavaExtensionBase):
             date,
         )
         return _json({**body, "ledger_errors": len(ledger.errors)}, 200)
+
+    @extension_endpoint("approve", ["POST"])
+    def approve_endpoint(self) -> Response:
+        items = parse_approve_request(request.get_json(silent=True))
+        if isinstance(items, Rejection):
+            return _error(items, 422)
+        if not _write_lock.acquire(timeout=LOCK_TIMEOUT):
+            busy = Rejection("", "busy", "Another write is still running; retry the request.")
+            return _error(busy, 503)
+        try:
+            return self._approve(items)
+        finally:
+            _write_lock.release()
+
+    def _approve(self, items: list[ApproveItem]) -> Response:
+        ledger = self.ledger
+        ledger.changed()
+        # The ledger reloads once after the last item, so earlier approvals in this request
+        # replace their entries here; a repeated id or key then sees the approved entry.
+        current = {hash_entry(txn): txn for txn in ledger.all_entries_by_type.Transaction}
+        results = []
+        for item in items:
+            result: dict[str, object] = {"id": item.id, "key": item.key}
+            entry = current.get(item.id)
+            if entry is None and item.key is not None:
+                link = f"ik-{item.key}"
+                entry = next((txn for txn in current.values() if link in txn.links), None)
+                if entry is None:
+                    result["result"] = "not_found"
+                elif entry.flag == "!":
+                    # The key names a pending entry, but not the version the user saw.
+                    result["result"] = "stale"
+                    entry = None
+            if entry is None:
+                result.setdefault("result", "stale")
+            elif entry.flag == "*":
+                result["result"] = "already"
+            elif entry.flag != "!":
+                result["result"] = "not_pending"
+            else:
+                new_id = self._approve_entry(entry)
+                if new_id is None:
+                    result["result"] = "stale"
+                else:
+                    del current[item.id]
+                    current[new_id] = entry._replace(flag="*")
+                    result.update(result="approved", new_id=new_id)
+            results.append(result)
+        if any(result["result"] == "approved" for result in results):
+            ledger.changed()
+        return _json({"results": results, "ledger_errors": len(ledger.errors)}, 200)
+
+    def _approve_entry(self, entry: Transaction) -> str | None:
+        try:
+            source, sha256sum = get_entry_slice(entry)
+            approved = approved_slice(source, entry)
+            if approved is None:
+                return None
+            self.ledger.file.save_entry_slice(hash_entry(entry), approved, sha256sum)
+        except FavaAPIError:
+            return None
+        return hash_entry(entry._replace(flag="*"))
 
     @extension_endpoint("mcp", ["GET", "POST", "PUT", "DELETE"])
     def mcp_endpoint(self) -> Response:

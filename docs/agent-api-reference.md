@@ -262,6 +262,85 @@ fava 在處理 extension 的請求之前會檢查 ledger 檔有沒有改變，�
 | `missing` | `date` | 缺少 `date`。 |
 | `invalid_date` | `date` | 不是 `YYYY-MM-DD` 格式的有效日期，或那個月的下一個月超出日期範圍（`9999-12`）。 |
 
+## `POST /<bfile>/extension/AgentApi/approve`
+
+把待核准（`!`）的交易核准成 `*`。只改交易首行的 flag 這一個字元，金額、帳戶、日期、payee、narration、metadata 與縮排都不變。沒有 `^ik-` link 的交易（例如在 fava 或編輯器手寫的）也可以核准。body 是 JSON 物件，`Content-Type` 是 `application/json`。
+
+這個端點只給 tars 的 daemon 在使用者按下核准時呼叫。MCP 沒有對應的 tool。
+
+| 欄位 | 必填 | 型別 | 規則 |
+|---|---|---|---|
+| `items` | 是 | 陣列 | 最多 50 筆。不接受其他欄位。 |
+| `items[].id` | 是 | string | `POST spending` 回應中那筆交易的 `id`，代表使用者看到的版本。 |
+| `items[].key` | 否 | string 或 `null` | 那筆交易的 `key`。`id` 已找不到時，改用 `^ik-<key>` 找那筆交易，讓重送有相同結果。 |
+
+請求：
+
+```json
+{"items": [{"id": "d362d2af421e7328385e5f90dc63e49a", "key": "web-123"}, {"id": "77aa0000000000000000000000000000"}]}
+```
+
+回應：
+
+```json
+{"results": [
+  {"id": "d362d2af421e7328385e5f90dc63e49a", "key": "web-123", "result": "approved", "new_id": "b529ca49a1c3aab4a1cb65c3b7c0225a"},
+  {"id": "77aa0000000000000000000000000000", "key": null, "result": "stale"}
+], "ledger_errors": 0}
+```
+
+`results` 的順序與請求相同，每筆帶回請求的 `id` 與 `key`。一筆失敗不影響其他筆。
+
+| `result` | 意思 |
+|---|---|
+| `approved` | 已從 `!` 改成 `*`。`new_id` 是核准後的 `id`。 |
+| `already` | 那筆交易已是 `*`：以 `id` 找到的交易已是 `*`，或 `id` 找不到但以 `key` 找到的交易已是 `*`。 |
+| `stale` | 帳本上沒有使用者看到的那個版本。可能是 `id` 找不到又沒有 `key`、以 `key` 找到的交易仍是 `!` 但內容或位置已改變，或檔案在讀取與寫入之間被改過。重新讀取 `POST spending`，再讓使用者決定。 |
+| `not_found` | `id` 找不到，以 `key` 也找不到交易。 |
+| `not_pending` | 找到了，但 flag 不是 `!` 也不是 `*`。 |
+
+### 處理順序
+
+```mermaid
+flowchart TD
+    Start["POST approve"] --> Valid{"body 有效？"}
+    Valid -->|否| R422["422 與 error.code"]
+    Valid -->|是| Lock{"10 秒內取得寫入鎖？"}
+    Lock -->|否| R503["503 busy"]
+    Lock -->|是| Reload["重新載入 ledger"]
+    Reload --> Each["依序處理每一筆"]
+    Each --> ById{"以 id 找到？"}
+    ById -->|否，沒有 key| Stale["stale"]
+    ById -->|否，有 key| ByKey{"以 ^ik-&lt;key&gt; 找到？"}
+    ByKey -->|否| NotFound["not_found"]
+    ByKey -->|是，flag 是 !| Stale
+    ByKey -->|是，其他 flag| Flag
+    ById -->|是| Flag{"flag？"}
+    Flag -->|*| Already["already"]
+    Flag -->|! 以外| NotPending["not_pending"]
+    Flag -->|!| Lines{"檔案中那幾行<br>仍是這筆交易？"}
+    Lines -->|否| Stale
+    Lines -->|是| Write["把首行的 ! 改成 *"] --> Approved["approved"]
+```
+
+寫入用 fava 的 `save_entry_slice`，與 fava 網頁編輯交易是同一個方法。寫入前解析檔案中那幾行，檢查日期、flag、payee、narration、帳戶與寫出的金額都與帳本中的交易相同，寫出的 tag 與 link 也都在交易上，避免檔案改過之後改到別筆交易。tag 只檢查寫出的部分，因為 `pushtag` 加上的 tag 不在那幾行中。寫入鎖與 `POST transactions` 共用，所以兩者不會同時寫檔。全部處理完後重新載入一次 ledger。
+
+### 回應
+
+| 狀態 | body | 意思 |
+|---|---|---|
+| 200 | `{"results", "ledger_errors"}` | 每一筆的結果。`ledger_errors` 是處理完後 fava 的帳本錯誤數量。 |
+| 422 | `{"error": {...}}` | 請求不符合規則。`error` 的格式同 `POST transactions`，`code` 見下表。 |
+| 503 | `{"error": {...}}` | `code` 是 `busy`。另一筆寫入還沒完成。以同樣的 body 重送。 |
+
+| 422 的 `code` | `field` | 原因 |
+|---|---|---|
+| `invalid_body` | 空字串 | body 不是 JSON 物件。 |
+| `unknown_field` | 該欄位，例如 `items[0].flag` | 不接受的欄位。 |
+| `missing` | `items` 或 `items[<n>].id` | 缺少必填欄位。 |
+| `invalid_type` | 該欄位，例如 `items[0]` | `items` 不是陣列、項目不是物件、`id` 不是 string，或 `key` 不是 string 也不是 `null`。 |
+| `too_many` | `items` | 超過 50 筆。 |
+
 ## MCP 端點 `/<bfile>/extension/AgentApi/mcp`
 
 ### 協定

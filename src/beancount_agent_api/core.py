@@ -11,6 +11,7 @@ from typing import Any
 from beancount.core import account as account_name
 from beancount.core import amount as beancount_amount
 from beancount.core.data import Close, Open, Posting, Transaction
+from beancount.parser import parser
 from fava.beans import create
 from fava.beans.funcs import hash_entry
 
@@ -462,3 +463,90 @@ def _sums(sums: Mapping[str, Decimal]) -> list[dict[str, str]]:
 def _decimal(number: Decimal) -> str:
     # A JSON number loses Decimal precision in JavaScript, and str() can print an exponent.
     return format(number, "f")
+
+
+@dataclass(frozen=True)
+class ApproveItem:
+    id: str
+    key: str | None
+
+
+MAX_APPROVE_ITEMS = 50
+# The flag token after the date on a transaction's first line.
+HEADER_FLAG_RE = re.compile(r"(\S+[ \t]+)!(?=[ \t]|$)")
+
+
+def parse_approve_request(raw: object) -> list[ApproveItem] | Rejection:
+    if not isinstance(raw, dict):
+        return Rejection(
+            "",
+            "invalid_body",
+            "Send a JSON object as the body, with Content-Type: application/json.",
+        )
+    for field in raw:
+        if field != "items":
+            return Rejection(
+                field, "unknown_field", f"Remove {field!r}; 'items' is the only field."
+            )
+    if "items" not in raw:
+        return Rejection("items", "missing", "Send 'items'.")
+    items = raw["items"]
+    if not isinstance(items, list):
+        return Rejection("items", "invalid_type", "Send 'items' as a JSON array.")
+    if len(items) > MAX_APPROVE_ITEMS:
+        return Rejection(
+            "items", "too_many", f"Send at most {MAX_APPROVE_ITEMS} items in one request."
+        )
+    parsed = []
+    for index, item in enumerate(items):
+        field = f"items[{index}]"
+        if not isinstance(item, dict):
+            return Rejection(field, "invalid_type", f"Send {field} as a JSON object.")
+        for name in item:
+            if name not in ("id", "key"):
+                return Rejection(
+                    f"{field}.{name}",
+                    "unknown_field",
+                    f"Remove {name!r}; accepted fields are id, key.",
+                )
+        if "id" not in item:
+            return Rejection(f"{field}.id", "missing", f"Send 'id' in {field}.")
+        if not isinstance(item["id"], str):
+            return Rejection(f"{field}.id", "invalid_type", "Send 'id' as a JSON string.")
+        key = item.get("key")
+        if key is not None and not isinstance(key, str):
+            return Rejection(f"{field}.key", "invalid_type", "Send 'key' as a JSON string or null.")
+        parsed.append(ApproveItem(item["id"], key))
+    return parsed
+
+
+def approved_slice(source: str, entry: Transaction) -> str | None:
+    """The entry's source lines with only the flag on the first line changed to `*`.
+
+    None when the lines are not this entry: fava finds them by the line number of its last
+    load, and the file may have changed since.
+    """
+    first, newline, rest = source.partition("\n")
+    match = HEADER_FLAG_RE.match(first)
+    if match is None or not _is_source_of(source, entry):
+        return None
+    return first[: match.end(1)] + "*" + first[match.end(1) + 1 :] + newline + rest
+
+
+def _is_source_of(source: str, entry: Transaction) -> bool:
+    parsed, errors, _ = parser.parse_string(source)
+    if errors or len(parsed) != 1 or not isinstance(parsed[0], Transaction):
+        return False
+    txn = parsed[0]
+    # pushtag adds tags and the loader fills amounts, neither of which the lines show.
+    return (
+        (txn.date, txn.flag, txn.payee, txn.narration)
+        == (entry.date, entry.flag, entry.payee, entry.narration)
+        and txn.tags <= entry.tags
+        and txn.links <= entry.links
+        and [p.account for p in txn.postings] == [p.account for p in entry.postings]
+        and all(
+            not isinstance(p.units, beancount_amount.Amount) or p.units == q.units
+            for p, q in zip(txn.postings, entry.postings, strict=True)
+        )
+    )
