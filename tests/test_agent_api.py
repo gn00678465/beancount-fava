@@ -399,12 +399,7 @@ def test_mcp_tools_list(in_process: InProcess) -> None:
         "private",
     )
     assert result["_meta"] == SERVER_META
-    assert tools["add_transaction"]["inputSchema"]["required"] == [
-        "source",
-        "target",
-        "amount",
-        "key",
-    ]
+    assert tools["add_transaction"]["inputSchema"]["required"] == ["source", "key"]
     assert tools["query"]["inputSchema"]["required"] == ["query_string"]
 
 
@@ -502,6 +497,117 @@ def test_mcp_shares_the_key_with_rest(in_process: InProcess) -> None:
     result = in_process.result(call("add_transaction", shared))
     assert result["structuredContent"]["created"] is False
     assert in_process.txns.read_text(encoding="utf-8").count("^ik-shared") == 1
+
+
+SPLIT = {
+    "date": "2026-09-24",
+    "source": "錢包",
+    "targets": [{"account": "晚餐", "amount": "190"}, {"account": "公務/午餐", "amount": "80.5"}],
+    "narration": "收據",
+    "key": "s1",
+}
+SPLIT_ENTRY = (
+    '2026-09-24 ! "收據" ^ik-s1\n'
+    "  Expenses:Food:Dinner                                  190 TWD\n"
+    "  Expenses:Work:Lunch                                  80.5 TWD\n"
+    "  Assets:TW:Cash                                     -270.5 TWD\n"
+)
+
+
+def test_split_dry_run_lists_every_posting(in_process: InProcess) -> None:
+    original = in_process.txns.read_text(encoding="utf-8")
+    assert in_process.add({**SPLIT, "dry_run": True}) == (
+        200,
+        {"created": False, "dry_run": True, "link": "ik-s1", "entry": SPLIT_ENTRY},
+    )
+    assert in_process.txns.read_text(encoding="utf-8") == original
+
+
+def test_split_retry_keeps_the_posting_order(in_process: InProcess) -> None:
+    original = in_process.txns.read_text(encoding="utf-8")
+    assert in_process.add(SPLIT) == (
+        201,
+        {
+            "created": True,
+            "link": "ik-s1",
+            "entry": SPLIT_ENTRY,
+            "errors": {"before": 0, "after": 0},
+        },
+    )
+    assert in_process.add(SPLIT) == (200, {"created": False, "link": "ik-s1", "entry": SPLIT_ENTRY})
+
+    reordered = {**SPLIT, "targets": SPLIT["targets"][::-1]}
+    status, body = in_process.add(reordered)
+    assert (status, body["error"]["code"], body["entry"]) == (409, "key_conflict", SPLIT_ENTRY)
+    assert in_process.txns.read_text(encoding="utf-8") == original + "\n" + SPLIT_ENTRY
+
+
+def ledger_copy(tmp_path: Path, name: str) -> InProcess:
+    shutil.copytree(AGENT_LEDGER, tmp_path / name)
+    app = create_app([str(tmp_path / name / "main.beancount")], poll_watcher=True)
+    return InProcess(app, tmp_path / name / "txns" / "2026.beancount")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        SPLIT,
+        {**SPLIT, "dry_run": True},
+        DINNER,
+        {
+            **SPLIT,
+            "targets": [*SPLIT["targets"], {"account": "Expenses:Food:Dinner", "amount": "1"}],
+        },
+        {**SPLIT, "target": "晚餐"},
+        {**SPLIT, "targets": []},
+    ],
+    ids=["split", "split dry run", "single target", "duplicate account", "both forms", "empty"],
+)
+def test_mcp_and_rest_return_the_same_body(tmp_path: Path, body: dict[str, Any]) -> None:
+    # Each side writes to its own copy, so both see the same ledger before the request.
+    rest, mcp = ledger_copy(tmp_path, "rest"), ledger_copy(tmp_path, "mcp")
+    status, rest_body = rest.add(body)
+    result = mcp.result(call("add_transaction", body))
+    assert result["structuredContent"] == rest_body
+    assert result["isError"] is (status >= 400)
+    assert rest.txns.read_bytes() == mcp.txns.read_bytes()
+
+
+def test_spending_reads_back_every_target_of_a_split(spending_app: SpendingApp) -> None:
+    split = {
+        "date": "2026-10-05",
+        "source": "錢包",
+        "targets": [
+            {"account": "晚餐", "amount": "120"},
+            {"account": "日用/雜貨", "amount": "35.5"},
+        ],
+        "key": "split",
+    }
+    response = spending_app.app.test_client().post(
+        "/spending/extension/AgentApi/transactions",
+        data=json.dumps(split),
+        content_type="application/json",
+    )
+    assert response.status_code == 201
+
+    txn = next(t for t in spending_app.day("2026-10-05")["transactions"] if t["key"] == "split")
+    assert (txn["expenses"], txn["funding"]) == (
+        [
+            {
+                "account": "Expenses:Food:Dinner",
+                "name_zh": "食物/晚餐",
+                "number": "120",
+                "currency": "TWD",
+            },
+            {
+                "account": "Expenses:Daily:Groceries",
+                "name_zh": "日用/雜貨",
+                "number": "35.5",
+                "currency": "TWD",
+            },
+        ],
+        [{"account": "Assets:TW:Cash", "name_zh": "錢包", "number": "-155.5", "currency": "TWD"}],
+    )
 
 
 def test_mcp_names_the_supported_version_for_legacy_clients(in_process: InProcess) -> None:

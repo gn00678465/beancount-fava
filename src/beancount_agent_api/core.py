@@ -63,12 +63,17 @@ class Accounts:
 
 
 @dataclass(frozen=True)
+class Target:
+    account: str
+    amount: Decimal
+
+
+@dataclass(frozen=True)
 class AddRequest:
     date: datetime.date
     time: str | None
     source: str
-    target: str
-    amount: Decimal
+    targets: tuple[Target, ...]
     currency: str
     narration: str
     payee: str | None
@@ -106,6 +111,10 @@ def _is_boolean(value: object) -> bool:
     return isinstance(value, bool)
 
 
+def _is_array(value: object) -> bool:
+    return isinstance(value, list)
+
+
 # Each request field with its JSON type check and the type name that a rejection shows.
 FIELD_TYPES: Mapping[str, tuple[Callable[[object], bool], str]] = {
     "date": (_is_string, "string"),
@@ -113,6 +122,7 @@ FIELD_TYPES: Mapping[str, tuple[Callable[[object], bool], str]] = {
     "source": (_is_string, "string"),
     "target": (_is_string, "string"),
     "amount": (_is_string, "string"),
+    "targets": (_is_array, "array"),
     "currency": (_is_string, "string"),
     "narration": (_is_string, "string"),
     "payee": (_is_string, "string"),
@@ -122,7 +132,10 @@ FIELD_TYPES: Mapping[str, tuple[Callable[[object], bool], str]] = {
     "dry_run": (_is_boolean, "boolean"),
 }
 FIELDS = tuple(FIELD_TYPES)
-REQUIRED = ("source", "target", "amount", "key")
+# 'targets' replaces 'target' and 'amount'; parse_add_request checks that pair itself.
+REQUIRED = ("source", "key")
+MAX_TARGETS = 20
+TARGET_FIELDS = ("account", "amount")
 # The link charset of beancount's lexer (lexer.l).
 KEY_RE = re.compile(r"[A-Za-z0-9\-_/.]+")
 DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
@@ -166,9 +179,25 @@ def parse_add_request(
         is_type, json_type = FIELD_TYPES[field]
         if not is_type(value):
             return Rejection(field, "invalid_type", f"Send {field!r} as a JSON {json_type}.")
-    for field in REQUIRED:
-        if field not in raw:
+    if "targets" in raw:
+        for field in ("target", "amount"):
+            if field in raw:
+                return Rejection(
+                    field,
+                    "target_or_targets",
+                    "Send either 'target' and 'amount', or 'targets', not both.",
+                )
+    for field in ("source", "target", "amount", "key"):
+        if field not in raw and (field in REQUIRED or "targets" not in raw):
             return Rejection(field, "missing", f"Send {field!r}.")
+    # Each target as (account field, account text, amount field, amount text); the single
+    # target keeps its own field names in rejections.
+    if "targets" in raw:
+        pairs = _target_pairs(raw["targets"])
+        if isinstance(pairs, Rejection):
+            return pairs
+    else:
+        pairs = [("target", raw["target"], "amount", raw["amount"])]
 
     key = raw["key"]
     if KEY_RE.fullmatch(key) is None:
@@ -209,14 +238,14 @@ def parse_add_request(
         field = "date" if "date" in raw else "time"
         return Rejection(field, "date_out_of_range", f"The date {date} is after {latest}.")
 
-    amount_text = raw["amount"]
-    if AMOUNT_RE.fullmatch(amount_text) is None or Decimal(amount_text) <= 0:
-        return Rejection(
-            "amount",
-            "invalid_amount",
-            "Send 'amount' as a positive decimal string with at most 2 decimals, such as \"190\".",
-        )
-    amount = Decimal(amount_text)
+    for _, _, amount_field, amount_text in pairs:
+        if AMOUNT_RE.fullmatch(amount_text) is None or Decimal(amount_text) <= 0:
+            return Rejection(
+                amount_field,
+                "invalid_amount",
+                f"Send {amount_field!r} as a positive decimal string with at most 2 decimals, "
+                'such as "190".',
+            )
 
     currency = raw.get("currency", accounts.default_currency)
     if currency is None:
@@ -272,19 +301,29 @@ def parse_add_request(
                 f"Remove line breaks and control characters from meta {meta_key!r}.",
             )
 
-    resolved = []
-    for field in ("source", "target"):
-        account = _resolve(field, raw[field], date, accounts)
+    source = _resolve("source", raw["source"], date, accounts)
+    if isinstance(source, Rejection):
+        return source
+    targets = []
+    for account_field, account_text, _, amount_text in pairs:
+        account = _resolve(account_field, account_text, date, accounts)
         if isinstance(account, Rejection):
             return account
-        resolved.append(account)
-    source, target = resolved
+        if account.name == source.name:
+            return Rejection(
+                account_field,
+                "same_account",
+                f"'source' and {account_field!r} both resolve to {source.name}.",
+            )
+        if any(account.name == target.name for target, _ in targets):
+            return Rejection(
+                account_field,
+                "duplicate_account",
+                f"{account.name} is already a target; send each account once.",
+            )
+        targets.append((account, Decimal(amount_text)))
 
-    if source.name == target.name:
-        return Rejection(
-            "target", "same_account", f"'source' and 'target' both resolve to {source.name}."
-        )
-    for account in (source, target):
+    for account in (source, *(target for target, _ in targets)):
         if currency not in account.currencies:
             return Rejection(
                 "currency",
@@ -296,8 +335,7 @@ def parse_add_request(
         date=date,
         time=local_time,
         source=source.name,
-        target=target.name,
-        amount=amount,
+        targets=tuple(Target(account.name, amount) for account, amount in targets),
         currency=currency,
         narration=narration,
         payee=payee or None,
@@ -306,6 +344,36 @@ def parse_add_request(
         key=key,
         dry_run=raw.get("dry_run", False),
     )
+
+
+def _target_pairs(raw: list[object]) -> list[tuple[str, str, str, str]] | Rejection:
+    if not raw:
+        return Rejection("targets", "missing", "Send at least one item in 'targets'.")
+    if len(raw) > MAX_TARGETS:
+        return Rejection("targets", "too_many", f"Send at most {MAX_TARGETS} items in 'targets'.")
+    pairs = []
+    for index, item in enumerate(raw):
+        field = f"targets[{index}]"
+        if not isinstance(item, dict):
+            return Rejection(
+                field, "invalid_type", f"Send {field} as a JSON object with account and amount."
+            )
+        for name in item:
+            if name not in TARGET_FIELDS:
+                return Rejection(
+                    f"{field}.{name}",
+                    "unknown_field",
+                    f"Remove {name!r}; accepted fields are account, amount.",
+                )
+        for name in TARGET_FIELDS:
+            if name not in item:
+                return Rejection(f"{field}.{name}", "missing", f"Send {name!r} in {field}.")
+            if not isinstance(item[name], str):
+                return Rejection(
+                    f"{field}.{name}", "invalid_type", f"Send {name!r} as a JSON string."
+                )
+        pairs.append((f"{field}.account", item["account"], f"{field}.amount", item["amount"]))
+    return pairs
 
 
 def _is_one_line(text: str) -> bool:
@@ -359,9 +427,15 @@ def build_transaction(req: AddRequest) -> Transaction:
         narration=req.narration,
         tags=req.tags,
         links=frozenset({req.link}),
+        # The key check compares printed entries, so the targets keep the request's order.
         postings=[
-            create.posting(req.target, create.amount(req.amount, req.currency)),
-            create.posting(req.source, create.amount(-req.amount, req.currency)),
+            *(
+                create.posting(t.account, create.amount(t.amount, req.currency))
+                for t in req.targets
+            ),
+            create.posting(
+                req.source, create.amount(-sum(t.amount for t in req.targets), req.currency)
+            ),
         ],
     )
 

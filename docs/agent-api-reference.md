@@ -67,19 +67,20 @@ fava 的 PUT 與 DELETE 端點對 agent 回 403：`PUT` 的 `add_document`、`ad
 
 ## `POST /<bfile>/extension/AgentApi/transactions`
 
-新增一筆交易。錢從 `source` 流到 `target`。body 是 JSON 物件，`Content-Type` 是 `application/json`。
+新增一筆交易。錢從 `source` 流到 `target`；一張收據要拆成多個費用時，改用 `targets` 列出每個帳戶與金額。body 是 JSON 物件，`Content-Type` 是 `application/json`。
 
 ### 欄位
 
 | 欄位 | 必填 | 型別 | 規則 |
 |---|---|---|---|
 | `source` | 是 | string | 錢流出的帳戶。可以是帳戶全名、完整的 `name-zh`，或 `name-zh` 以 `/` 分段的最後一段。 |
-| `target` | 是 | string | 錢流入的帳戶。格式同 `source`。 |
-| `amount` | 是 | string | `[0-9]{1,15}(\.[0-9]{1,2})?`，大於 0。 |
+| `target` | `target` 加 `amount`，與 `targets` 擇一 | string | 錢流入的帳戶。格式同 `source`。 |
+| `amount` | `target` 加 `amount`，與 `targets` 擇一 | string | `[0-9]{1,15}(\.[0-9]{1,2})?`，大於 0。 |
+| `targets` | `target` 加 `amount`，與 `targets` 擇一 | 物件陣列 | 1 到 20 筆，每筆是 `{"account", "amount"}`，兩個欄位都必填，不接受其他欄位。`account` 的格式同 `source`，`amount` 的規則同 `amount`。同一個帳戶只能出現一次。 |
 | `key` | 是 | string | `[A-Za-z0-9\-_/.]+`。寫成 link `^ik-<key>`。 |
 | `date` | `date` 與 `time` 擇一 | string | `YYYY-MM-DD`。 |
 | `time` | `date` 與 `time` 擇一 | string | RFC 3339，要有時區，例如 `2026-09-25T07:00:00+08:00`。fava 換算成 `Asia/Taipei` 的日期，並加上 metadata `time: "07:00:00"`。 |
-| `currency` | 否 | string | 預設是第一個 `operating_currency`。兩個帳戶都必須接受這個幣別。 |
+| `currency` | 否 | string | 預設是第一個 `operating_currency`。`source` 與每個 `target` 都必須接受這個幣別。 |
 | `narration` | 否 | string | 說明，例如品名。預設是空字串。不能有 Unicode 類別 `Cc`、`Cs`、`Zl`、`Zp` 的字元。 |
 | `payee` | 否 | string | 交易對象，例如店家或代墊人。規則同 `narration`。空字串等於沒有 payee。 |
 | `tags` | 否 | string 陣列 | 每個 tag 只能用 `[A-Za-z0-9\-_/.]`，不含 `#`。重複的 tag 只寫一次。beancount 不接受中文 tag。 |
@@ -91,11 +92,12 @@ fava 的 PUT 與 DELETE 端點對 agent 回 403：`PUT` 的 `add_document`、`ad
 - 不接受上表以外的欄位。`links` 不開放，`^ik-<key>` 是唯一的 link。
 - 日期不能晚於 `Asia/Taipei` 的今天加 366 天。
 - 帳戶在該日期必須是開啟的。開帳日不能晚於該日期。帳戶有關帳日時，關帳日不能早於該日期。
-- `source` 與 `target` 不能是同一個帳戶。
+- `source` 與 `target`（或 `targets` 中的任何帳戶）不能是同一個帳戶。
+- `targets` 中的帳戶以別名解析後不能重複，例如「晚餐」與 `Expenses:Food:Dinner` 算同一個。
 
 ### 寫入的交易
 
-交易一律是 `!` flag。`target` 是正數，`source` 是負數。tag 依字母排序。metadata 依 key 排序，包含 `time`。
+交易一律是 `!` flag。`target` 是正數，`source` 是負數。用 `targets` 時，費用 posting 依請求的順序排列，最後是 `source`，金額是所有 `targets` 的加總取負號；不另外傳總額。tag 依字母排序。metadata 依 key 排序，包含 `time`。
 
 以測試用的 ledger 為例，「錢包」是 `Assets:TW:Cash`，「晚餐」是 `Expenses:Food:Dinner`。
 
@@ -127,6 +129,30 @@ fava 的 PUT 與 DELETE 端點對 agent 回 403：`PUT` 的 `add_document`、`ad
 
 以 `"tags": ["family", "reimburse", "family"]` 與 `"meta": {"note": "還代墊", "via": "line-pay"}` 重送同一個 key，回 200 與同一筆交易。只送 `"tags": ["reimburse"]` 則回 409。
 
+拆成多個費用的請求，「公務/午餐」是 `Expenses:Work:Lunch`：
+
+```json
+{
+  "date": "2026-09-24",
+  "source": "錢包",
+  "targets": [
+    {"account": "晚餐", "amount": "190"},
+    {"account": "公務/午餐", "amount": "80.5"}
+  ],
+  "narration": "收據",
+  "key": "s1"
+}
+```
+
+寫入的交易：
+
+```beancount
+2026-09-24 ! "收據" ^ik-s1
+  Expenses:Food:Dinner                                  190 TWD
+  Expenses:Work:Lunch                                  80.5 TWD
+  Assets:TW:Cash                                     -270.5 TWD
+```
+
 ### 處理順序與冪等
 
 ```mermaid
@@ -144,7 +170,7 @@ flowchart TD
     Dry -->|否| Write["寫入 default-file"] --> R201["201 created: true"]
 ```
 
-比較交易文字時不比較 flag，所以已核准成 `*` 的交易也算相同。tag 與 metadata 已排序，所以重送時欄位的順序不影響結果。
+比較交易文字時不比較 flag，所以已核准成 `*` 的交易也算相同。tag 與 metadata 已排序，所以重送時欄位的順序不影響結果。`targets` 不排序：以同一個 key 重送時，`targets` 的順序不同就是不同的交易，回 409。
 
 使用者在 fava 核准時如果同時修改了交易（例如 narration、tag 或 metadata），之後以同一個 key 重送會得到 409。
 
@@ -168,15 +194,17 @@ fava 寫入前不檢查整本帳。201 的 `errors` 是寫入前後 fava 的錯�
 | 422 的 `code` | `field` | 原因 |
 |---|---|---|
 | `invalid_body` | 空字串 | body 不是 JSON 物件。 |
-| `unknown_field` | 該欄位 | 不接受的欄位。 |
-| `invalid_type` | 該欄位 | 型別錯誤。`dry_run` 要是 boolean，`tags` 要是 string 陣列，`meta` 要是值為 string 的物件，其他要是 string。 |
-| `missing` | 該欄位 | 缺少必填欄位，或 ledger 沒有 `operating_currency` 且請求沒有 `currency`。 |
+| `unknown_field` | 該欄位，例如 `targets[0].note` | 不接受的欄位。 |
+| `invalid_type` | 該欄位，例如 `targets[0]`、`targets[1].amount` | 型別錯誤。`dry_run` 要是 boolean，`tags` 要是 string 陣列，`meta` 要是值為 string 的物件，`targets` 要是物件陣列，其他要是 string。 |
+| `missing` | 該欄位，例如 `target`、`targets[0].amount` | 缺少必填欄位、`targets` 是空陣列，或 ledger 沒有 `operating_currency` 且請求沒有 `currency`。`target`、`amount` 與 `targets` 都沒送時，`field` 是 `target`。 |
+| `target_or_targets` | `target` 或 `amount` | 同時送了 `targets` 與 `target` 或 `amount`。 |
+| `too_many` | `targets` | 超過 20 筆。 |
 | `invalid_key` | `key` | key 有不允許的字元。 |
 | `date_or_time` | `date` | `date` 與 `time` 都有或都沒有。 |
 | `invalid_date` | `date` | 不是 `YYYY-MM-DD` 或不是有效日期。 |
 | `invalid_time` | `time` | 不是帶時區的 RFC 3339。 |
 | `date_out_of_range` | `date` 或 `time` | 日期晚於今天加 366 天。 |
-| `invalid_amount` | `amount` | 格式錯誤、超過兩位小數或不大於 0。 |
+| `invalid_amount` | `amount` 或 `targets[<n>].amount` | 格式錯誤、超過兩位小數或不大於 0。 |
 | `invalid_currency` | `currency` | 不是幣別代碼。 |
 | `invalid_narration` | `narration` | 有換行或控制字元。 |
 | `invalid_payee` | `payee` | 有換行或控制字元。 |
@@ -184,12 +212,13 @@ fava 寫入前不檢查整本帳。201 的 `errors` 是寫入前後 fava 的錯�
 | `invalid_meta_key` | `meta` | key 不符合 `[a-z][a-zA-Z0-9\-_]*`。 |
 | `reserved_meta_key` | `meta` | key 是 `time`、`filename` 或 `lineno`。 |
 | `invalid_meta_value` | `meta` | 值有換行或控制字元。 |
-| `invalid_account_name` | `source` 或 `target` | 不是別名，也不是有效的帳戶名稱。 |
-| `unknown_account` | `source` 或 `target` | 帳戶名稱有效，但 ledger 沒有開這個帳戶。 |
-| `ambiguous_account` | `source` 或 `target` | 別名符合多個帳戶，`candidates` 列出它們。 |
-| `account_not_open` | `source` 或 `target` | 日期早於開帳日。 |
-| `account_closed` | `source` 或 `target` | 日期晚於關帳日。 |
-| `same_account` | `target` | `source` 與 `target` 是同一個帳戶。 |
+| `invalid_account_name` | `source`、`target` 或 `targets[<n>].account` | 不是別名，也不是有效的帳戶名稱。 |
+| `unknown_account` | `source`、`target` 或 `targets[<n>].account` | 帳戶名稱有效，但 ledger 沒有開這個帳戶。 |
+| `ambiguous_account` | `source`、`target` 或 `targets[<n>].account` | 別名符合多個帳戶，`candidates` 列出它們。 |
+| `account_not_open` | `source`、`target` 或 `targets[<n>].account` | 日期早於開帳日。 |
+| `account_closed` | `source`、`target` 或 `targets[<n>].account` | 日期晚於關帳日。 |
+| `same_account` | `target` 或 `targets[<n>].account` | 與 `source` 是同一個帳戶。 |
+| `duplicate_account` | `targets[<n>].account` | 這個帳戶已在前面的 `targets` 出現過。 |
 | `currency_not_allowed` | `currency` | 帳戶不接受這個幣別。 |
 
 ## `POST /<bfile>/extension/AgentApi/spending`
@@ -396,7 +425,7 @@ flowchart TD
 |---|---|---|
 | `list_accounts` | 無 | 與 `GET /<bfile>/api/ledger_data` 的 body 相同。 |
 | `query` | `query_string`（BQL，必填） | 與 `GET /<bfile>/api/query` 的 body 相同，但沒有 fava 的篩選條件。 |
-| `add_transaction` | 與 `POST transactions` 的欄位相同，包含 `payee`、`tags`、`meta` | 與 `POST transactions` 的 body 相同。 |
+| `add_transaction` | 與 `POST transactions` 的欄位相同，包含 `payee`、`tags`、`meta`、`targets`。`inputSchema` 的 `required` 只有 `source` 與 `key`，`target` 加 `amount` 與 `targets` 擇一寫在說明中。 | 與 `POST transactions` 的 body 相同。 |
 
 `tools/call` 的結果有三個欄位。
 
