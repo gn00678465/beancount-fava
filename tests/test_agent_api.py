@@ -16,6 +16,7 @@ import pytest
 from conftest import AGENT_TOKEN, REPO, docker, ledger_volume_of, running_fava
 from fava.application import create_app
 from fava.core import FavaLedger
+from fava.core.file import FileModule
 
 from beancount_agent_api import extension
 from beancount_agent_api.core import FIELDS
@@ -1310,6 +1311,130 @@ def test_approve_changes_one_byte_in_any_layout(
     flag = data.index(b"!")
     assert ledger.read_bytes() == data[:flag] + b"*" + data[flag + 1 :]
     assert app.day("2026-10-05")["transactions"][0]["id"] == body["results"][0]["new_id"]
+
+
+def test_approve_refuses_a_version_that_came_and_went_during_its_load(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    version_a = spending_app.txns.read_bytes()
+    version_b = version_a.replace('note: "還代墊"'.encode(), 'note: "另一筆"'.encode())
+    spending_app.txns.write_bytes(version_b)
+    id_b = pending_ids(spending_app, "2026-08-10")["代墊午餐"]
+    spending_app.txns.write_bytes(version_a)
+
+    # Before and after the load the file holds A, but the load itself parses B.
+    load = extension.load_uncached
+    swaps = [None]
+
+    def load_b(*args: Any, **kwargs: Any) -> Any:
+        if not swaps:
+            return load(*args, **kwargs)
+        swaps.pop()
+        spending_app.txns.write_bytes(version_b)
+        try:
+            return load(*args, **kwargs)
+        finally:
+            spending_app.txns.write_bytes(version_a)
+
+    monkeypatch.setattr(extension, "load_uncached", load_b)
+    status, body = approve(spending_app, {"items": [{"id": id_b}]})
+    assert (status, body["results"][0]["result"]) == (200, "stale")
+    assert spending_app.txns.read_bytes() == version_a
+
+
+def test_approve_refuses_a_change_after_its_load(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    appended = b"; written by an editor\n"
+    expected = spending_app.txns.read_bytes() + appended
+    find = extension.flag_offset
+
+    def append_then_find(data: bytes, lineno: int) -> int | None:
+        # Between approve's load and its last check of the file.
+        with spending_app.txns.open("ab") as txns:
+            txns.write(appended)
+        return find(data, lineno)
+
+    monkeypatch.setattr(extension, "flag_offset", append_then_find)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"]) == (200, "stale")
+    assert spending_app.txns.read_bytes() == expected
+
+
+def test_approve_waits_for_a_save_in_fava(spending_app: SpendingApp, monkeypatch: Any) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    client = spending_app.app.test_client()
+    path = str(spending_app.txns)
+    source = client.get("/spending/api/source", query_string={"file_path": path}).json["data"]
+    saved = source["source"] + "\n; saved in fava\n"
+
+    # Hold fava's save after it has read the file under its lock.
+    holding, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    get_source = FileModule.get_source
+
+    def held_get_source(module: FileModule, file_path: Path) -> Any:
+        result = get_source(module, file_path)
+        if threading.current_thread().name == "fava save":
+            holding.set()
+            assert release.wait(30)
+        return result
+
+    class WatchedLock:
+        def __init__(self, lock: Any) -> None:
+            self.lock = lock
+
+        def __enter__(self) -> None:
+            if threading.current_thread().name == "approve":
+                waiting.set()
+            self.lock.acquire()
+
+        def __exit__(self, *exc: object) -> None:
+            self.lock.release()
+
+    monkeypatch.setattr(FileModule, "get_source", held_get_source)
+    ledger = spending_app.app.config["LEDGERS"].ledgers[0]
+    ledger.file._lock = WatchedLock(ledger.file._lock)
+
+    def save() -> Any:
+        threading.current_thread().name = "fava save"
+        body = {"file_path": path, "source": saved, "sha256sum": source["sha256sum"]}
+        return client.put("/spending/api/source", json=body).status_code
+
+    def approve_by_name() -> Any:
+        threading.current_thread().name = "approve"
+        return approve(spending_app, {"items": [{"id": id_}]})
+
+    fava_save = Background(save)
+    try:
+        assert holding.wait(30)
+        approving = Background(approve_by_name)
+        # The approval reaches fava's lock while fava's save still holds it.
+        assert waiting.wait(30)
+    finally:
+        release.set()
+    deadline = time.monotonic() + 30
+    assert fava_save.result(deadline) == 200
+    status, body = approving.result(deadline)
+
+    # fava's save wrote first, so the approval sees a changed file and writes nothing.
+    assert (status, body["results"][0]["result"]) == (200, "stale")
+    assert spending_app.txns.read_text(encoding="utf-8") == saved
+
+
+def test_approve_does_not_need_the_watcher_notice(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    watcher = spending_app.app.config["LEDGERS"].ledgers[0].watcher
+
+    def refuse(_watcher: object, path: Path) -> None:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(type(watcher), "notify", refuse)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"]) == (200, "approved")
+    assert body["results"][0]["new_id"] == pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
 
 
 class HookedFile:

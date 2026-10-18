@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime
+import logging
+import os
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,6 +29,8 @@ from beancount_agent_api.core import (
 
 if TYPE_CHECKING:
     from fava.core import FavaLedger
+
+log = logging.getLogger(__name__)
 
 TZ = ZoneInfo("Asia/Taipei")
 LOCK_TIMEOUT = 10
@@ -130,7 +134,10 @@ class AgentApi(FavaExtensionBase):
         """Load the ledger from its files, with the bytes that load parsed.
 
         fava's own ledger can lag the files while another request reloads it, so approve
-        loads by itself. Equal bytes before and after the load tie its entries to them.
+        loads by itself. Equal bytes alone do not tie the entries to them: a file can change
+        and change back during the load. Any write moves the file's ctime, so an unchanged
+        inode, size, mtime, and ctime as well rule that out, as far as the file system's
+        timestamps resolve two writes.
         """
         paths = list(self.ledger.options["include"])
         for _ in range(LOAD_ATTEMPTS):
@@ -139,7 +146,7 @@ class AgentApi(FavaExtensionBase):
             paths = list(options["include"])
             after = _read_files(paths)
             if before is not None and before == after:
-                return entries, after
+                return entries, {path: data for path, (data, _) in after.items()}
         return None
 
     def _write_flag(self, entry: Transaction, files: dict[str, bytes]) -> tuple[str, str | None]:
@@ -168,9 +175,9 @@ class AgentApi(FavaExtensionBase):
             except FileNotFoundError:
                 return "stale", None
             except OSError as error:
-                self.ledger.watcher.notify(Path(path))
+                _notify(self.ledger, path)
                 return "error", f"Writing * to {where} failed ({error}); {unknown}."
-            self.ledger.watcher.notify(Path(path))
+            _notify(self.ledger, path)
             try:
                 with open(path, "rb") as file:
                     written = file.read()
@@ -243,11 +250,26 @@ class AgentApi(FavaExtensionBase):
         return to_string(entry, options.currency_column, options.indent)
 
 
-def _read_files(paths: list[str]) -> dict[str, bytes] | None:
+def _notify(ledger: FavaLedger, path: str) -> None:
+    # fava's watcher also finds the write by itself; the notice only records it at once.
     try:
-        return {path: Path(path).read_bytes() for path in paths}
+        ledger.watcher.notify(Path(path))
+    except OSError as error:
+        log.warning("cannot notify fava's watcher of %s: %s", path, error)
+
+
+def _read_files(paths: list[str]) -> dict[str, tuple[bytes, tuple[int, ...]]] | None:
+    """Each file's bytes and the stat fields that change on any write to it."""
+    files = {}
+    try:
+        for path in paths:
+            with Path(path).open("rb") as file:
+                stat = os.fstat(file.fileno())
+                stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                files[path] = (file.read(), stamp)
     except FileNotFoundError:
         return None
+    return files
 
 
 def _error(rejection: Rejection, status: int, **extra: object) -> Response:
