@@ -462,3 +462,72 @@ def _sums(sums: Mapping[str, Decimal]) -> list[dict[str, str]]:
 def _decimal(number: Decimal) -> str:
     # A JSON number loses Decimal precision in JavaScript, and str() can print an exponent.
     return format(number, "f")
+
+
+@dataclass(frozen=True)
+class ApproveItem:
+    id: str
+    key: str | None
+
+
+MAX_APPROVE_ITEMS = 50
+# The flag token after the date on a transaction's first line, in the file's bytes.
+HEADER_FLAG_RE = re.compile(rb"[^ \t\r\n]+[ \t]+(!)(?=[ \t\r\n;]|$)")
+
+
+def parse_approve_request(raw: object) -> list[ApproveItem] | Rejection:
+    if not isinstance(raw, dict):
+        return Rejection(
+            "",
+            "invalid_body",
+            "Send a JSON object as the body, with Content-Type: application/json.",
+        )
+    for field in raw:
+        if field != "items":
+            return Rejection(
+                field, "unknown_field", f"Remove {field!r}; 'items' is the only field."
+            )
+    if "items" not in raw:
+        return Rejection("items", "missing", "Send 'items'.")
+    items = raw["items"]
+    if not isinstance(items, list):
+        return Rejection("items", "invalid_type", "Send 'items' as a JSON array.")
+    if len(items) > MAX_APPROVE_ITEMS:
+        return Rejection(
+            "items", "too_many", f"Send at most {MAX_APPROVE_ITEMS} items in one request."
+        )
+    parsed = []
+    for index, item in enumerate(items):
+        field = f"items[{index}]"
+        if not isinstance(item, dict):
+            return Rejection(field, "invalid_type", f"Send {field} as a JSON object.")
+        for name in item:
+            if name not in ("id", "key"):
+                return Rejection(
+                    f"{field}.{name}",
+                    "unknown_field",
+                    f"Remove {name!r}; accepted fields are id, key.",
+                )
+        if "id" not in item:
+            return Rejection(f"{field}.id", "missing", f"Send 'id' in {field}.")
+        if not isinstance(item["id"], str):
+            return Rejection(f"{field}.id", "invalid_type", "Send 'id' as a JSON string.")
+        key = item.get("key")
+        if key is not None and not isinstance(key, str):
+            return Rejection(f"{field}.key", "invalid_type", "Send 'key' as a JSON string or null.")
+        parsed.append(ApproveItem(item["id"], key))
+    return parsed
+
+
+def flag_offset(data: bytes, lineno: int) -> int | None:
+    """Byte offset of the `!` flag on line `lineno` (1-based) of a file's bytes.
+
+    None when that line does not start like a pending transaction.
+    """
+    start = 0
+    for _ in range(lineno - 1):
+        start = data.find(b"\n", start) + 1
+        if start == 0:
+            return None
+    match = HEADER_FLAG_RE.match(data, start)
+    return None if match is None else match.start(1)

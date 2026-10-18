@@ -16,7 +16,7 @@ flowchart LR
     Agent["Agent<br>Claude Code"] -->|"區網 http://192.168.2.11:5656<br>Authorization: Bearer"| Guard
     subgraph Container["fava container（port 5000）"]
         Guard["guard<br>檢查憑證與路徑"] --> Fava["fava 網頁與 /api/"]
-        Guard --> Ext["AgentApi extension<br>transactions、spending、mcp"]
+        Guard --> Ext["AgentApi extension<br>transactions、spending、approve、mcp"]
         Ext --> Fava
     end
     Fava --> Ledger[("ledger 檔<br>/ledger")]
@@ -25,10 +25,12 @@ flowchart LR
 | 身分 | 憑證 | 可以做的事 |
 |---|---|---|
 | 瀏覽器 | Cloudflare Access 的 JWT | fava 的全部功能，包含核准、修改、刪除交易 |
-| Agent | Bearer token | 讀 fava `/api/` 的 GET 端點。經由 `AgentApi` 讀花費、新增 `!` 交易 |
+| Agent | Bearer token | 讀 fava `/api/` 的 GET 端點。經由 `AgentApi` 讀花費、新增 `!` 交易、核准 `!` 交易 |
 | 其他 | 沒有或無效 | 一律 401 |
 
-Agent 不能修改、刪除或核准交易。這些請求回 403。
+Agent 不能修改或刪除交易。這些請求回 403。
+
+`POST approve` 只給 tars 的 daemon 在使用者於網頁按下核准時呼叫。端點本身不分辨呼叫者：持有 agent token 的任何程式都能核准。聊天中的 agent 不核准，這個限制由 daemon 與 Skill 負責。
 
 ## 記一筆帳的流程
 
@@ -214,7 +216,7 @@ Claude Code 只在啟動時讀環境變數。設定環境變數之前就在執�
 
 - **以 `fava` 覆寫指令會略過憑證檢查。** container 的指令改成 `fava` 時，fava 啟動時沒有 guard。任何人都能讀寫帳本。image 不阻擋這個設定。保持預設指令 `beancount-fava-serve`，並以步驟 5 的 401 檢查確認。
 - **偽造的 JWT 可能拖慢 fava。** JWT 的 `kid` 不在已取得的公鑰中時，fava 重新下載公鑰，每次最多等 2 秒。能連到 5656 的人可以大量送出這種 JWT，佔住 fava 的 worker。這是由程式碼推論，沒有量測。
-- **區網的 token 以明文傳送。** 5656 是純 HTTP。能監聽區網封包的裝置可以取得 token。取得 token 的人可以讀整本帳並新增 `!` 交易，不能修改、刪除或核准。懷疑外洩時，更換 token 檔的內容並重新啟動 container。
+- **區網的 token 以明文傳送。** 5656 是純 HTTP。能監聽區網封包的裝置可以取得 token。取得 token 的人可以讀整本帳、新增 `!` 交易，並把 `!` 交易核准成 `*`，但不能修改或刪除。懷疑外洩時，更換 token 檔的內容並重新啟動 container。
 - **JWT 可以在區網重放。** 取得有效 JWT 的人在 `exp` 之前可以直接送到 5656。縮短 Access application 的 session duration 可以縮小這個時間。
 - **沒有 body 大小上限。** guard、extension 與 fava 都不限制請求 body 的大小。guard 先檢查憑證，所以只有持有 token 或有效 JWT 的人能送出大 body。
 - **文字欄位沒有長度上限，並接受 `Cf` 類別的字元。** 這適用於 `key`、`narration`、`payee` 與 `meta` 的值。例如 U+202E（right-to-left override）會讓顯示順序與實際文字不同。核准前仔細讀交易文字，有疑問時在 fava 的編輯器檢查原始文字。

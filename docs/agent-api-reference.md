@@ -262,6 +262,117 @@ fava 在處理 extension 的請求之前會檢查 ledger 檔有沒有改變，�
 | `missing` | `date` | 缺少 `date`。 |
 | `invalid_date` | `date` | 不是 `YYYY-MM-DD` 格式的有效日期，或那個月的下一個月超出日期範圍（`9999-12`）。 |
 
+## `POST /<bfile>/extension/AgentApi/approve`
+
+把待核准（`!`）的交易核准成 `*`。只改交易首行的 flag 這一個字元，金額、帳戶、日期、payee、narration、metadata 與縮排都不變。沒有 `^ik-` link 的交易（例如在 fava 或編輯器手寫的）也可以核准。body 是 JSON 物件，`Content-Type` 是 `application/json`。
+
+這個端點只給 tars 的 daemon 在使用者按下核准時呼叫。MCP 沒有對應的 tool。
+
+| 欄位 | 必填 | 型別 | 規則 |
+|---|---|---|---|
+| `items` | 是 | 陣列 | 最多 50 筆。不接受其他欄位。 |
+| `items[].id` | 是 | string | `POST spending` 回應中那筆交易的 `id`，代表使用者看到的版本。 |
+| `items[].key` | 否 | string 或 `null` | 那筆交易的 `key`。`id` 已找不到時，改用 `^ik-<key>` 找那筆交易，讓重送有相同結果。 |
+
+請求：
+
+```json
+{"items": [{"id": "d362d2af421e7328385e5f90dc63e49a", "key": "web-123"}, {"id": "77aa0000000000000000000000000000"}]}
+```
+
+回應：
+
+```json
+{"results": [
+  {"id": "d362d2af421e7328385e5f90dc63e49a", "key": "web-123", "result": "approved", "new_id": "b529ca49a1c3aab4a1cb65c3b7c0225a"},
+  {"id": "77aa0000000000000000000000000000", "key": null, "result": "stale"}
+], "ledger_errors": 0, "reload_error": null}
+```
+
+`results` 的順序與請求相同，每筆帶回請求的 `id` 與 `key`。一筆失敗不影響其他筆。
+
+| `result` | 意思 |
+|---|---|
+| `approved` | 已從 `!` 改成 `*`，並已讀回確認。`new_id` 是核准後的 `id`，取自寫入後再載入一次的帳本，所以 plugin 依 flag 改變的資料也算在內。那次載入對不上這次寫入的內容時（例如檔案在寫入後又被改過），`new_id` 是 `null`，重新讀取 `POST spending` 取得 `id`。 |
+| `already` | 那筆交易已是 `*`：以 `id` 找到的交易已是 `*`，或 `id` 找不到但以 `key` 找到的交易已是 `*`。 |
+| `stale` | 帳本上沒有使用者看到的那個版本，沒有寫入。可能是 `id` 找不到又沒有 `key`、以 `key` 找到的交易仍是 `!` 但內容或位置已改變，或檔案在核准讀取之後、寫入之前被改過。重新讀取 `POST spending`，再讓使用者決定。 |
+| `not_found` | `id` 找不到，以 `key` 也找不到交易。 |
+| `not_pending` | 找到了，但 flag 不是 `!` 也不是 `*`。 |
+| `error` | 結果未知：寫入或讀回時發生 I/O 錯誤，或讀回的內容不是預期的內容。那筆可能已核准，也可能沒有。`message` 寫出檔案與位元組位置。重新讀取 `POST spending`，並在 fava 檢查那個檔案。 |
+
+`error` 的 `message` 範例：
+
+```text
+/ledger/txns.beancount at byte 1234 did not read back as approved: another program wrote the file while the flag was written. That byte may now be a stray * in the other program's text, and it is not restored; check the file in fava.
+```
+
+讀回不符表示另一個程式剛好在寫入的瞬間存了檔。若它是原地存檔，`*` 會寫進它的新內容中同一個位元組位置，取代原本的字元。這個位元組不會自動復原，要在 fava 打開那個檔案，檢查那個位置。
+
+### 處理順序
+
+```mermaid
+flowchart TD
+    Start["POST approve"] --> Valid{"body 有效？"}
+    Valid -->|否| R422["422 與 error.code"]
+    Valid -->|是| Lock{"10 秒內取得寫入鎖？"}
+    Lock -->|否| R503["503 busy"]
+    Lock -->|是| Load{"載入帳本，載入前後<br>檔案都沒有改變？"}
+    Load -->|試 3 次都不同| R503
+    Load -->|讀不到檔案，<br>或宣告的檔案不存在| Unreadable["503 ledger_unreadable"]
+    Load -->|是| Each["依序處理每一筆"]
+    Each --> ById{"以 id 找到？"}
+    ById -->|否，沒有 key| Stale["stale"]
+    ById -->|否，有 key| ByKey{"以 ^ik-&lt;key&gt; 找到？"}
+    ByKey -->|否| NotFound["not_found"]
+    ByKey -->|是，flag 是 !| Stale
+    ByKey -->|是，其他 flag| Flag
+    ById -->|是| Flag{"flag？"}
+    Flag -->|*| Already["already"]
+    Flag -->|! 以外| NotPending["not_pending"]
+    Flag -->|!| Same{"檔案仍與<br>載入時相同？"}
+    Same -->|否| Stale
+    Same -->|是| Write["把 flag 那一個位元組<br>改成 *"]
+    Write --> Back{"讀回是預期的內容？"}
+    Back -->|是| Approved["approved"]
+    Back -->|否，或 I/O 錯誤| Error["error"]
+    Approved --> NewId["全部處理完後再載入一次，<br>取得 new_id"]
+```
+
+核准不使用 fava 記憶體中的帳本，因為另一個請求正在重新載入時，那份帳本可能還是舊的（見 `POST spending`）。核准在寫入鎖內自己載入一次帳本，並在載入前後各讀一次所有檔案的位元組，以及 inode、大小、mtime 與 ctime。兩次全部相同，這次載入的交易才對應到磁碟上的內容；否則重試，最多 3 次。
+
+只比位元組不夠。檔案可能在載入期間被改掉又改回原樣，前後讀到的位元組相同，載入的卻是中間那個版本。每次寫入都會更新 ctime，所以加上 stat 的比對就能發現這種情況，前提是檔案系統的時間戳記分辨得出這兩次寫入。本機 Linux 7.2 的 tmpfs 與 btrfs 實測 2000 次都分辨得出；Unraid 的 shfs 與 SMB 掛載沒有實測。
+
+`id` 是 fava 的 entry hash，涵蓋交易的全部內容，包含 metadata、tag、link、cost、price、檔名與行號。只有使用者看到的那個版本會符合。內容改過，或同一位置換成了另一筆相似的交易，都回 `stale`。
+
+寫入時只改 flag 那一個位元組。檔案的其他位元組都不變，包括換行字元（LF 或 CRLF）與檔尾有沒有換行。檔案的 inode、擁有者與權限也不變。寫入後再以路徑讀回整個檔案，確認只有那一個位元組改變。全部處理完後，核准自己再載入一次帳本，取得每一筆核准後的 `new_id`，再重新載入 fava 的 ledger。所以有寫入的請求會完整載入帳本三次：核准前一次、取得 `new_id` 一次、fava 重新載入一次。帳本越大越久，這段時間其他新增與核准要等寫入鎖。
+
+### 與其他寫入者的同步
+
+| 寫入者 | 保證 |
+|---|---|
+| 同一個 fava process 內的寫入：`POST approve`、`POST transactions`、fava 網頁的編輯與存檔 | 彼此不會覆蓋。前兩者共用 API 的寫入鎖，寫入時另外持有 fava 自己的檔案鎖。 |
+| 外部編輯器在核准讀取檔案之前存的內容 | 都會保留。核准發現檔案與載入時不同，就回 `stale`，不寫入。 |
+| 外部編輯器在核准載入期間改檔，又改回原樣 | 回 `stale`，不寫入。前提是檔案系統的時間戳記分辨得出這兩次寫入，見上文。 |
+| 外部編輯器剛好在核准寫入的瞬間存檔 | 核准可能把 `*` 寫到錯的位置，或核准遺失。這種情況回 `error`，不回 `approved`。網頁要重新讀取，並請使用者在 fava 檢查那個檔案。 |
+
+外部編輯器不使用任何鎖，所以沒有方法完全排除最後一種情況。不要在核准的同時，用外部編輯器編輯同一個檔案。
+
+### 回應
+
+| 狀態 | body | 意思 |
+|---|---|---|
+| 200 | `{"results", "ledger_errors", "reload_error"}` | 每一筆的結果。`ledger_errors` 是處理完後 fava 的帳本錯誤數量。`reload_error` 平時是 `null`。處理完後 fava 重新載入失敗時，`reload_error` 是說明文字，`ledger_errors` 是 `null`；`results` 仍是實際結果，已寫入的筆照樣回 `approved`。這時 fava 可能繼續顯示這次請求之前的帳本，直到帳本檔案再次變更或 fava 重新啟動。 |
+| 422 | `{"error": {...}}` | 請求不符合規則。`error` 的格式同 `POST transactions`，`code` 見下表。 |
+| 503 | `{"error": {...}}` | 一筆都沒有處理。`code` 是 `busy` 時，另一筆寫入還沒完成，或載入帳本時檔案一直在改變，以同樣的 body 重送。`code` 是 `ledger_unreadable` 時，讀不到某個帳本檔案，`message` 寫出是哪個檔案或哪個 `include`；網頁可以顯示「帳本讀不到」，修好檔案後再重送。讀不到包括：沒有讀取權限、主檔不存在、主檔仍有 `include` 宣告但檔案不存在（也包括 glob 沒有對應任何檔案）。已從主檔移除 `include` 宣告的檔案不算，核准照新的帳本處理。 |
+
+| 422 的 `code` | `field` | 原因 |
+|---|---|---|
+| `invalid_body` | 空字串 | body 不是 JSON 物件。 |
+| `unknown_field` | 該欄位，例如 `items[0].flag` | 不接受的欄位。 |
+| `missing` | `items` 或 `items[<n>].id` | 缺少必填欄位。 |
+| `invalid_type` | 該欄位，例如 `items[0]` | `items` 不是陣列、項目不是物件、`id` 不是 string，或 `key` 不是 string 也不是 `null`。 |
+| `too_many` | `items` | 超過 50 筆。 |
+
 ## MCP 端點 `/<bfile>/extension/AgentApi/mcp`
 
 ### 協定

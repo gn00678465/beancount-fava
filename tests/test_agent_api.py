@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import threading
 import time
@@ -9,14 +10,16 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import fava.core as fava_core
 import pytest
 from conftest import AGENT_TOKEN, REPO, docker, ledger_volume_of, running_fava
 from fava.application import create_app
 from fava.core import FavaLedger
+from fava.core.file import FileModule
 
+from beancount_agent_api import extension
 from beancount_agent_api.core import FIELDS
 
 AGENT_LEDGER = REPO / "tests" / "fixtures" / "agent-ledger"
@@ -211,17 +214,27 @@ def test_mcp_over_http(fava: Fava) -> None:
     assert fava.txns() == original + "\n" + DINNER_ENTRY
 
 
-def test_agent_reads_spending_only_by_post(fava: Fava) -> None:
+def test_agent_reads_spending_and_approves_only_by_post(fava: Fava) -> None:
     path = "/extension/AgentApi/spending"
     status, body = fava.request("POST", path, {"date": "2026-09-20"})
     assert (status, [txn["narration"] for txn in body["transactions"]]) == (200, ["dinner"])
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{fava.port}/agent{path}",
-        headers={"Authorization": f"Bearer {AGENT_TOKEN}"},
+
+    assert fava.add(DINNER)[0] == 201
+    [dinner] = fava.request("POST", path, {"date": "2026-09-24"})[1]["transactions"]
+    status, body = fava.request(
+        "POST", "/extension/AgentApi/approve", {"items": [{"id": dinner["id"], "key": "d1"}]}
     )
-    with pytest.raises(urllib.error.HTTPError) as error:
-        urllib.request.urlopen(request, timeout=30)
-    assert error.value.code == 403
+    assert (status, body["results"][0]["result"]) == (200, "approved")
+    assert fava.txns().endswith(DINNER_ENTRY.replace(" ! ", " * "))
+
+    for endpoint in ("spending", "approve"):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{fava.port}/agent/extension/AgentApi/{endpoint}",
+            headers={"Authorization": f"Bearer {AGENT_TOKEN}"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=30)
+        assert error.value.code == 403
 
 
 @dataclass(frozen=True)
@@ -1012,3 +1025,782 @@ def test_spending_ignores_filters_of_concurrent_queries(spending_app: SpendingAp
     assert (query_done, spending_done) == (rounds, rounds)
     assert spending_wrong == 0
     assert query_wrong > 0
+
+
+APPROVE = "/spending/extension/AgentApi/approve"
+
+
+def approve(app: SpendingApp, body: object) -> tuple[int, Any]:
+    response = app.app.test_client().post(
+        APPROVE, data=json.dumps(body), content_type="application/json"
+    )
+    return response.status_code, response.get_json()
+
+
+def pending_ids(app: SpendingApp, *dates: str) -> dict[str, str]:
+    """Narration to id of each listed transaction on the dates."""
+    return {txn["narration"]: txn["id"] for date in dates for txn in app.day(date)["transactions"]}
+
+
+def test_approve_changes_only_the_flag(spending_app: SpendingApp) -> None:
+    ids = pending_ids(spending_app, "2026-10-05", "2026-08-10", "2026-08-11")
+    before = spending_app.txns.read_bytes()
+    names = ["採買與晚餐", "代墊午餐", "停車"]
+    keys = ["web-123", "lunch", None]
+
+    status, body = approve(
+        spending_app, {"items": [{"id": ids[name], "key": key} for name, key in zip(names, keys)]}
+    )
+
+    after = ids | pending_ids(spending_app, "2026-10-05", "2026-08-10", "2026-08-11")
+    assert (status, body) == (
+        200,
+        {
+            "results": [
+                {"id": ids[name], "key": key, "result": "approved", "new_id": after[name]}
+                for name, key in zip(names, keys)
+            ],
+            "ledger_errors": 0,
+            "reload_error": None,
+        },
+    )
+    # A split entry with payee, one with metadata and tags, and one without payee.
+    expected = before
+    for header in (
+        '2026-10-05 ! "全聯" "採買與晚餐" ^ik-web-123',
+        '2026-08-10 ! "小明" "代墊午餐" #reimburse ^ik-lunch',
+        '2026-08-11 ! "停車"',
+    ):
+        encoded = header.encode()
+        assert expected.count(encoded) == 1
+        expected = expected.replace(encoded, encoded.replace(b" ! ", b" * ", 1))
+    assert spending_app.txns.read_bytes() == expected
+    assert spending_app.day("2026-08-11")["transactions"][0]["flag"] == "*"
+
+
+def test_approve_retry_with_the_old_id(spending_app: SpendingApp) -> None:
+    old = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    assert approve(spending_app, {"items": [{"id": old, "key": "web-123"}]})[0] == 200
+    approved = spending_app.txns.read_bytes()
+
+    status, body = approve(spending_app, {"items": [{"id": old, "key": "web-123"}, {"id": old}]})
+    assert (status, body["results"]) == (
+        200,
+        [
+            {"id": old, "key": "web-123", "result": "already"},
+            {"id": old, "key": None, "result": "stale"},
+        ],
+    )
+    assert spending_app.txns.read_bytes() == approved
+
+
+def test_approve_outcomes(spending_app: SpendingApp) -> None:
+    ids = pending_ids(spending_app, "2026-10-05", "2026-08-12")
+    before = spending_app.txns.read_bytes()
+    items = [
+        {"id": ids["退貨"]},
+        {"id": ids["待查"], "key": "odd"},
+        {"id": "0" * 32, "key": "missing"},
+        # The key names a pending entry, but the id is not the version the user saw.
+        {"id": "0" * 32, "key": "web-123"},
+        {"id": "0" * 32, "key": "odd"},
+    ]
+    status, body = approve(spending_app, {"items": items})
+    assert (status, [result["result"] for result in body["results"]]) == (
+        200,
+        ["already", "not_pending", "not_found", "stale", "not_pending"],
+    )
+    assert spending_app.txns.read_bytes() == before
+
+
+def test_approve_twice_in_one_request(spending_app: SpendingApp) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    status, body = approve(
+        spending_app, {"items": [{"id": id_, "key": "web-123"}, {"id": id_, "key": "web-123"}]}
+    )
+    assert (status, [result["result"] for result in body["results"]]) == (
+        200,
+        ["approved", "already"],
+    )
+    assert spending_app.txns.read_text(encoding="utf-8").count('2026-10-05 * "全聯"') == 2
+
+
+def during_another_reload(app: SpendingApp, monkeypatch: Any, action: Callable[[], Any]) -> Any:
+    """Run action while another request is held inside load_file.
+
+    fava's watcher has already handed that request the change, so action sees the ledger and
+    line numbers from before the change.
+    """
+    loading, release = threading.Event(), threading.Event()
+    load = fava_core.load_uncached
+
+    def held_load(*args: Any, **kwargs: Any) -> Any:
+        # Only the other request's load is held; a reload after a write passes through.
+        if not loading.is_set():
+            loading.set()
+            assert release.wait(30)
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(fava_core, "load_uncached", held_load)
+    other = Background(lambda: app.app.test_client().get("/spending/income_statement/"))
+    try:
+        assert loading.wait(30)
+        outcome = action()
+    finally:
+        release.set()
+    assert other.result(time.monotonic() + 30).status_code == 200
+    return outcome
+
+
+def test_approve_during_another_reload_never_edits_another_entry(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    ids = pending_ids(spending_app, "2026-10-05", "2026-08-10")
+    text = spending_app.txns.read_text(encoding="utf-8")
+    header = '2026-10-05 ! "全聯" "採買與晚餐"'
+    inserted = '2026-10-05 ! "插入"\n  Expenses:Food:Dinner  10 TWD\n  Assets:TW:Cash\n\n'
+    moved = text.replace(header, inserted + header)
+    spending_app.txns.write_text(moved, encoding="utf-8")
+
+    # The first old line number now points at the inserted pending entry.
+    items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
+    status, body = during_another_reload(
+        spending_app, monkeypatch, lambda: approve(spending_app, {"items": items})
+    )
+    assert (status, [result["result"] for result in body["results"]]) == (200, ["stale", "stale"])
+    assert spending_app.txns.read_text(encoding="utf-8") == moved
+
+    ids = pending_ids(spending_app, "2026-10-05", "2026-08-10")
+    items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
+    status, body = approve(spending_app, {"items": items})
+    assert [result["result"] for result in body["results"]] == ["approved", "approved"]
+    assert spending_app.txns.read_text(encoding="utf-8") == moved.replace(
+        '2026-10-05 ! "全聯"', '2026-10-05 * "全聯"'
+    ).replace('2026-08-10 ! "小明"', '2026-08-10 * "小明"')
+
+
+def test_approve_during_another_reload_after_the_file_shrank(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    ids = pending_ids(spending_app, "2026-10-05", "2026-08-10")
+    shrunk = spending_app.txns.read_text(encoding="utf-8").split("\n\n")[0] + "\n"
+    spending_app.txns.write_text(shrunk, encoding="utf-8")
+
+    # The old line numbers now point past the end of the file.
+    items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
+    status, body = during_another_reload(
+        spending_app, monkeypatch, lambda: approve(spending_app, {"items": items})
+    )
+    assert (status, [result["result"] for result in body["results"]]) == (200, ["stale", "stale"])
+    assert spending_app.txns.read_text(encoding="utf-8") == shrunk
+
+
+def edit_after_load(monkeypatch: Any, edit: Callable[[], None]) -> None:
+    """Run edit once, right after approve's own load of the ledger."""
+    load = extension.load_uncached
+    edits = [edit]
+
+    def load_then_edit(*args: Any, **kwargs: Any) -> Any:
+        loaded = load(*args, **kwargs)
+        while edits:
+            edits.pop()()
+        return loaded
+
+    monkeypatch.setattr(extension, "load_uncached", load_then_edit)
+
+
+@pytest.mark.parametrize(
+    ("name", "old", "new"),
+    [
+        ("代墊午餐", '  note: "還代墊"', '  note: "另一筆"'),
+        ("代墊午餐", "#reimburse ^ik-lunch", "^ik-lunch"),
+        ("訂金", "10.50 USD @ 32.1 TWD", "10.50 USD @ 40 TWD"),
+    ],
+)
+@pytest.mark.parametrize("when", ["during another reload", "during approve"])
+def test_approve_refuses_a_changed_version(
+    spending_app: SpendingApp, monkeypatch: Any, name: str, old: str, new: str, when: str
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05", "2026-08-10")[name]
+    changed = spending_app.txns.read_text(encoding="utf-8").replace(old, new)
+    assert changed != spending_app.txns.read_text(encoding="utf-8")
+
+    def edit() -> None:
+        spending_app.txns.write_text(changed, encoding="utf-8")
+
+    def send() -> Any:
+        return approve(spending_app, {"items": [{"id": id_}]})
+
+    if when == "during another reload":
+        # fava's ledger still has the old version at the same line.
+        edit()
+        status, body = during_another_reload(spending_app, monkeypatch, send)
+    else:
+        edit_after_load(monkeypatch, edit)
+        status, body = send()
+    assert (status, body["results"][0]["result"]) == (200, "stale")
+    assert spending_app.txns.read_text(encoding="utf-8") == changed
+
+
+def test_approve_refuses_a_similar_entry_at_the_old_line(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    text = spending_app.txns.read_text(encoding="utf-8")
+    header = '2026-10-05 ! "全聯" "採買與晚餐" ^ik-web-123\n'
+    body_lines = text.split(header, 1)[1].split("\n\n", 1)[0]
+    # The same entry without the link, inserted where the original started.
+    twin = '2026-10-05 ! "全聯" "採買與晚餐"\n' + body_lines + "\n\n"
+    moved = text.replace(header, twin + header)
+    spending_app.txns.write_text(moved, encoding="utf-8")
+
+    # fava's ledger still points the id at the old line, where the twin now starts.
+    status, body = during_another_reload(
+        spending_app, monkeypatch, lambda: approve(spending_app, {"items": [{"id": id_}]})
+    )
+    assert (status, body["results"][0]["result"]) == (200, "stale")
+    assert spending_app.txns.read_text(encoding="utf-8") == moved
+
+
+def test_approve_keeps_an_append_made_after_its_load(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    appended = "; written by an editor\n"
+
+    def append() -> None:
+        with spending_app.txns.open("a", encoding="utf-8") as txns:
+            txns.write(appended)
+
+    edit_after_load(monkeypatch, append)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"]) == (200, "approved")
+    text = spending_app.txns.read_text(encoding="utf-8")
+    assert text.endswith(appended)
+    assert '2026-10-05 * "全聯" "採買與晚餐" ^ik-web-123' in text
+
+
+@pytest.mark.parametrize(
+    "header",
+    ['2026-10-05\t!\t"Tab"', '2026-10-05  !  "Spaces"  ; note', '2026-10-05 ! "Plain"'],
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("final_newline", [True, False])
+def test_approve_changes_one_byte_in_any_layout(
+    tmp_path: Path, header: str, newline: str, final_newline: bool
+) -> None:
+    ledger = tmp_path / "main.beancount"
+    lines = [
+        'option "title" "Spending"',
+        'option "operating_currency" "TWD"',
+        'option "name_expenses" "Costs"',
+        '2020-01-01 custom "fava-extension" "beancount_agent_api"',
+        "2026-01-01 open Assets:Cash TWD",
+        "2026-01-01 open Costs:Food TWD",
+        "",
+        header,
+        "  Costs:Food  100 TWD",
+        "  Assets:Cash",
+    ]
+    data = newline.join(lines).encode() + (newline.encode() if final_newline else b"")
+    ledger.write_bytes(data)
+    app = SpendingApp(create_app([str(ledger)], poll_watcher=True), ledger)
+    [txn] = app.day("2026-10-05")["transactions"]
+    assert app.day("2026-10-05")["ledger_errors"] == 0
+
+    status, body = approve(app, {"items": [{"id": txn["id"]}]})
+    assert (status, body["results"][0]["result"]) == (200, "approved")
+    flag = data.index(b"!")
+    assert ledger.read_bytes() == data[:flag] + b"*" + data[flag + 1 :]
+    assert app.day("2026-10-05")["transactions"][0]["id"] == body["results"][0]["new_id"]
+
+
+def test_approve_refuses_a_version_that_came_and_went_during_its_load(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    version_a = spending_app.txns.read_bytes()
+    version_b = version_a.replace('note: "還代墊"'.encode(), 'note: "另一筆"'.encode())
+    spending_app.txns.write_bytes(version_b)
+    id_b = pending_ids(spending_app, "2026-08-10")["代墊午餐"]
+    spending_app.txns.write_bytes(version_a)
+
+    # Before and after the load the file holds A, but the load itself parses B.
+    load = extension.load_uncached
+    swaps = [None]
+
+    def load_b(*args: Any, **kwargs: Any) -> Any:
+        if not swaps:
+            return load(*args, **kwargs)
+        swaps.pop()
+        spending_app.txns.write_bytes(version_b)
+        try:
+            return load(*args, **kwargs)
+        finally:
+            spending_app.txns.write_bytes(version_a)
+
+    monkeypatch.setattr(extension, "load_uncached", load_b)
+    status, body = approve(spending_app, {"items": [{"id": id_b}]})
+    assert (status, body["results"][0]["result"]) == (200, "stale")
+    assert spending_app.txns.read_bytes() == version_a
+
+
+def test_approve_refuses_a_change_after_its_load(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    appended = b"; written by an editor\n"
+    expected = spending_app.txns.read_bytes() + appended
+    find = extension.flag_offset
+
+    def append_then_find(data: bytes, lineno: int) -> int | None:
+        # Between approve's load and its last check of the file.
+        with spending_app.txns.open("ab") as txns:
+            txns.write(appended)
+        return find(data, lineno)
+
+    monkeypatch.setattr(extension, "flag_offset", append_then_find)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"]) == (200, "stale")
+    assert spending_app.txns.read_bytes() == expected
+
+
+def test_approve_waits_for_a_save_in_fava(spending_app: SpendingApp, monkeypatch: Any) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    client = spending_app.app.test_client()
+    path = str(spending_app.txns)
+    source = client.get("/spending/api/source", query_string={"file_path": path}).json["data"]
+    saved = source["source"] + "\n; saved in fava\n"
+
+    # Hold fava's save after it has read the file under its lock.
+    holding, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    get_source = FileModule.get_source
+
+    def held_get_source(module: FileModule, file_path: Path) -> Any:
+        result = get_source(module, file_path)
+        if threading.current_thread().name == "fava save":
+            holding.set()
+            assert release.wait(30)
+        return result
+
+    class WatchedLock:
+        def __init__(self, lock: Any) -> None:
+            self.lock = lock
+
+        def __enter__(self) -> None:
+            if threading.current_thread().name == "approve":
+                waiting.set()
+            self.lock.acquire()
+
+        def __exit__(self, *exc: object) -> None:
+            self.lock.release()
+
+    monkeypatch.setattr(FileModule, "get_source", held_get_source)
+    ledger = spending_app.app.config["LEDGERS"].ledgers[0]
+    ledger.file._lock = WatchedLock(ledger.file._lock)
+
+    def save() -> Any:
+        threading.current_thread().name = "fava save"
+        body = {"file_path": path, "source": saved, "sha256sum": source["sha256sum"]}
+        return client.put("/spending/api/source", json=body).status_code
+
+    def approve_by_name() -> Any:
+        threading.current_thread().name = "approve"
+        return approve(spending_app, {"items": [{"id": id_}]})
+
+    fava_save = Background(save)
+    try:
+        assert holding.wait(30)
+        approving = Background(approve_by_name)
+        # The approval reaches fava's lock while fava's save still holds it.
+        assert waiting.wait(30)
+    finally:
+        release.set()
+    deadline = time.monotonic() + 30
+    assert fava_save.result(deadline) == 200
+    status, body = approving.result(deadline)
+
+    # fava's save wrote first, so the approval sees a changed file and writes nothing.
+    assert (status, body["results"][0]["result"]) == (200, "stale")
+    assert spending_app.txns.read_text(encoding="utf-8") == saved
+
+
+def test_approve_does_not_need_the_watcher_notice(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    watcher = spending_app.app.config["LEDGERS"].ledgers[0].watcher
+
+    def refuse(_watcher: object, path: Path) -> None:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(type(watcher), "notify", refuse)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"]) == (200, "approved")
+    assert body["results"][0]["new_id"] == pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+
+
+class HookedFile:
+    """A file whose write runs a hook first."""
+
+    def __init__(self, file: Any, before_write: Callable[[], None]) -> None:
+        self._file = file
+        self._before_write = before_write
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._file.close()
+
+    def read(self) -> bytes:
+        return self._file.read()
+
+    def seek(self, offset: int) -> int:
+        return self._file.seek(offset)
+
+    def write(self, data: bytes) -> int:
+        self._before_write()
+        return self._file.write(data)
+
+
+def hook_approve_io(
+    monkeypatch: Any,
+    *,
+    before_write: Callable[[], None] | None = None,
+    before_read_back: Callable[[], None] | None = None,
+) -> None:
+    """Run hooks inside approve's write: after its last check, and before it reads back."""
+    real_open = open
+
+    def hooked_open(path: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        if mode == "rb" and before_read_back is not None:
+            before_read_back()
+        file = real_open(path, mode, *args, **kwargs)
+        if mode == "r+b" and before_write is not None:
+            return HookedFile(file, before_write)
+        return file
+
+    monkeypatch.setattr(extension, "open", hooked_open, raising=False)
+
+
+def test_approve_reports_a_failed_write_and_goes_on(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    ids = pending_ids(spending_app, "2026-10-05", "2026-08-10")
+    before = spending_app.txns.read_bytes()
+    failures = [OSError(5, "Input/output error")]
+
+    def fail_once() -> None:
+        if failures:
+            raise failures.pop()
+
+    hook_approve_io(monkeypatch, before_write=fail_once)
+    items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
+    status, body = approve(spending_app, {"items": items})
+
+    first, second = body["results"]
+    offset = before.index('2026-10-05 ! "全聯"'.encode()) + len("2026-10-05 ")
+    assert (status, first["result"], second["result"]) == (200, "error", "approved")
+    assert f"{spending_app.txns} at byte {offset}" in first["message"]
+    assert "Input/output error" in first["message"]
+    assert "new_id" not in first
+    assert second["new_id"] == pending_ids(spending_app, "2026-08-10")["代墊午餐"]
+    assert spending_app.txns.read_text(encoding="utf-8") == before.decode().replace(
+        '2026-08-10 ! "小明"', '2026-08-10 * "小明"'
+    )
+
+
+FLAG_META_PLUGIN = """
+from beancount.core.data import Transaction
+
+__plugins__ = ["flag_meta"]
+
+
+def flag_meta(entries, options_map):
+    return [
+        e._replace(meta={**e.meta, "review-status": e.flag}) if isinstance(e, Transaction) else e
+        for e in entries
+    ], []
+"""
+
+
+def test_approve_takes_new_id_from_a_load_with_plugins(tmp_path: Path, monkeypatch: Any) -> None:
+    # The plugin copies the flag into the metadata, so the approved entry is more than the old
+    # entry with a new flag.
+    (tmp_path / "plugins").mkdir()
+    (tmp_path / "plugins" / "flag_meta_plugin.py").write_text(FLAG_META_PLUGIN)
+    monkeypatch.syspath_prepend(str(tmp_path / "plugins"))
+    shutil.copytree(SPENDING_LEDGER, tmp_path / "ledger")
+    main = tmp_path / "ledger" / "main.beancount"
+    main.write_text('plugin "flag_meta_plugin"\n' + main.read_text(encoding="utf-8"))
+    app = SpendingApp(
+        create_app([str(main)], poll_watcher=True), tmp_path / "ledger" / "txns.beancount"
+    )
+
+    id_ = pending_ids(app, "2026-10-05")["採買與晚餐"]
+    status, body = approve(app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"]) == (200, "approved")
+    assert body["results"][0]["new_id"] == pending_ids(app, "2026-10-05")["採買與晚餐"]
+    assert app.day("2026-10-05")["ledger_errors"] == 0
+
+
+def test_approve_leaves_new_id_null_when_the_file_changed_after_the_write(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    load_files = extension.AgentApi._load_files
+    loads = []
+
+    def edit_before_the_second_load(self: Any) -> Any:
+        loads.append(None)
+        if len(loads) == 2:
+            with spending_app.txns.open("ab") as txns:
+                txns.write(b"; written by an editor\n")
+        return load_files(self)
+
+    monkeypatch.setattr(extension.AgentApi, "_load_files", edit_before_the_second_load)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"]) == (200, "approved")
+    assert body["results"][0]["new_id"] is None
+    assert spending_app.txns.read_bytes().endswith(b"; written by an editor\n")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads files without read permission")
+def test_approve_processes_nothing_when_a_file_cannot_be_read(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    before = spending_app.txns.read_bytes()
+    parse = extension.parse_approve_request
+
+    def parse_then_lock_out(raw: object) -> Any:
+        # After fava's own reload for this request, before approve reads the files.
+        spending_app.txns.chmod(0)
+        return parse(raw)
+
+    monkeypatch.setattr(extension, "parse_approve_request", parse_then_lock_out)
+    try:
+        status, body = approve(spending_app, {"items": [{"id": id_}]})
+    finally:
+        spending_app.txns.chmod(0o644)
+    assert (status, body["error"]["code"]) == (503, "ledger_unreadable")
+    assert str(spending_app.txns) in body["error"]["message"]
+    assert "no item was processed" in body["error"]["message"]
+    assert spending_app.txns.read_bytes() == before
+
+
+OTHER_FILE_ENTRY = (
+    '\n2026-10-05 ! "主檔" "主檔中的待核准"\n  Expenses:Food:Dinner  2 TWD\n  Assets:TW:Cash\n'
+)
+
+
+def with_entry_in_main(app: SpendingApp) -> tuple[Path, list[dict[str, str]]]:
+    """Adds a pending entry to main.beancount; returns it and an item for each file."""
+    main = app.txns.with_name("main.beancount")
+    with main.open("a", encoding="utf-8") as file:
+        file.write(OTHER_FILE_ENTRY)
+    ids = pending_ids(app, "2026-10-05")
+    return main, [{"id": ids["採買與晚餐"], "key": "web-123"}, {"id": ids["主檔中的待核准"]}]
+
+
+def delete_after_fava_reload(
+    monkeypatch: Any, path: Path, edit: Callable[[], None] = lambda: None
+) -> None:
+    parse = extension.parse_approve_request
+
+    def parse_then_delete(raw: object) -> Any:
+        # After fava's own reload for this request, before approve reads the files.
+        edit()
+        path.unlink()
+        return parse(raw)
+
+    monkeypatch.setattr(extension, "parse_approve_request", parse_then_delete)
+
+
+@pytest.mark.parametrize("missing", ["main", "include"])
+def test_approve_processes_nothing_when_a_declared_file_is_missing(
+    spending_app: SpendingApp, monkeypatch: Any, missing: str
+) -> None:
+    main, items = with_entry_in_main(spending_app)
+    gone, kept = (main, spending_app.txns) if missing == "main" else (spending_app.txns, main)
+    before = kept.read_bytes()
+
+    delete_after_fava_reload(monkeypatch, gone)
+    status, body = approve(spending_app, {"items": items})
+
+    assert (status, body["error"]["code"]) == (503, "ledger_unreadable")
+    assert gone.name in body["error"]["message"]
+    assert kept.read_bytes() == before
+
+
+def test_approve_loads_a_ledger_whose_include_was_removed(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    main, items = with_entry_in_main(spending_app)
+
+    def drop_include() -> None:
+        main.write_text(
+            main.read_text(encoding="utf-8").replace('include "txns.beancount"', ""),
+            encoding="utf-8",
+        )
+
+    delete_after_fava_reload(monkeypatch, spending_app.txns, drop_include)
+    status, body = approve(spending_app, {"items": items})
+
+    assert (status, [item["result"] for item in body["results"]]) == (
+        200,
+        ["not_found", "approved"],
+    )
+    assert '2026-10-05 * "主檔" "主檔中的待核准"' in main.read_text(encoding="utf-8")
+
+
+def test_approve_loads_a_ledger_with_other_load_errors(spending_app: SpendingApp) -> None:
+    main = spending_app.txns.with_name("main.beancount")
+    with main.open("a", encoding="utf-8") as file:
+        file.write('\nplugin "no_such_plugin_for_tests"\n')
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"], body["ledger_errors"]) == (200, "approved", 1)
+
+
+def test_approve_reports_a_failed_reload(spending_app: SpendingApp, monkeypatch: Any) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    approve_ = extension.AgentApi._approve
+    changed = FavaLedger.changed
+    inside = []
+
+    def tracked_approve(self: Any, items: Any) -> Any:
+        inside.append(None)
+        try:
+            return approve_(self, items)
+        finally:
+            inside.clear()
+
+    def changed_failing_in_approve(ledger: FavaLedger) -> bool:
+        if inside:
+            raise OSError(5, "Input/output error")
+        return changed(ledger)
+
+    monkeypatch.setattr(extension.AgentApi, "_approve", tracked_approve)
+    monkeypatch.setattr(FavaLedger, "changed", changed_failing_in_approve)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+
+    assert (status, body["results"][0]["result"]) == (200, "approved")
+    assert body["ledger_errors"] is None
+    assert "Input/output error" in body["reload_error"]
+    assert body["results"][0]["new_id"] == pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+
+
+def test_approve_reports_a_failed_read_back(spending_app: SpendingApp, monkeypatch: Any) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+
+    def fail() -> None:
+        raise OSError(5, "Input/output error")
+
+    hook_approve_io(monkeypatch, before_read_back=fail)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"]) == (200, "error")
+    assert "Reading" in body["results"][0]["message"]
+    assert "may or may not be approved" in body["results"][0]["message"]
+
+
+@pytest.mark.parametrize("save", ["in place", "by rename"])
+def test_approve_reports_an_editor_saving_during_the_write(
+    spending_app: SpendingApp, monkeypatch: Any, save: str
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    original = spending_app.txns.read_bytes()
+    edited = b"; added on top\n" + original
+
+    def editor_saves() -> None:
+        if save == "in place":
+            spending_app.txns.write_bytes(edited)
+        else:
+            replacement = spending_app.txns.with_name("editor.tmp")
+            replacement.write_bytes(edited)
+            replacement.replace(spending_app.txns)
+
+    hook_approve_io(monkeypatch, before_write=editor_saves)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+
+    [result] = body["results"]
+    offset = original.index(b"!")
+    assert (status, result["result"]) == (200, "error")
+    assert f"{spending_app.txns} at byte {offset}" in result["message"]
+    assert "not restored" in result["message"]
+    written = spending_app.txns.read_bytes()
+    if save == "in place":
+        # The documented risk: the byte lands at the same offset in the editor's text.
+        assert written == edited[:offset] + b"*" + edited[offset + 1 :]
+    else:
+        # The write went to the replaced file, so the approval is lost.
+        assert written == edited
+
+
+def test_approve_and_add_concurrently(spending_app: SpendingApp) -> None:
+    ids = pending_ids(spending_app, "2026-10-05", "2026-08-10", "2026-08-11")
+    pending = [ids[name] for name in ("採買與晚餐", "訂金", "代墊午餐", "停車")]
+    barrier = threading.Barrier(2, timeout=30)
+
+    def add() -> list[int]:
+        client = spending_app.app.test_client()
+        barrier.wait()
+        statuses = []
+        for n in range(20):
+            body = {"date": "2026-10-06", "source": "錢包", "target": "晚餐", "amount": "5"}
+            response = client.post(
+                "/spending/extension/AgentApi/transactions",
+                data=json.dumps({**body, "key": f"c{n}"}),
+                content_type="application/json",
+            )
+            statuses.append(response.status_code)
+        return statuses
+
+    def approve_each() -> list[str]:
+        barrier.wait()
+        results = []
+        for id_ in pending:
+            status, body = approve(spending_app, {"items": [{"id": id_}]})
+            assert status == 200
+            results.append(body["results"][0]["result"])
+        return results
+
+    statuses, results = run_together(add, approve_each, timeout=120)
+
+    text = spending_app.txns.read_text(encoding="utf-8")
+    assert (statuses, results) == ([201] * 20, ["approved"] * 4)
+    assert all(text.count(f"^ik-c{n}\n") == 1 for n in range(20))
+    flags = [
+        txn["flag"]
+        for date in ("2026-10-05", "2026-08-10", "2026-08-11")
+        for txn in spending_app.day(date)["transactions"]
+    ]
+    assert flags == ["*"] * 5
+    assert len(spending_app.day("2026-10-06")["transactions"]) == 20
+
+
+@pytest.mark.parametrize(
+    ("body", "field", "code"),
+    [
+        (["x"], "", "invalid_body"),
+        ({"items": [], "all": True}, "all", "unknown_field"),
+        ({}, "items", "missing"),
+        ({"items": {"id": "x"}}, "items", "invalid_type"),
+        ({"items": ["x"]}, "items[0]", "invalid_type"),
+        ({"items": [{"id": "x"}, {"key": "k"}]}, "items[1].id", "missing"),
+        ({"items": [{"id": 1}]}, "items[0].id", "invalid_type"),
+        ({"items": [{"id": "x", "key": 1}]}, "items[0].key", "invalid_type"),
+        ({"items": [{"id": "x", "flag": "*"}]}, "items[0].flag", "unknown_field"),
+        ({"items": [{"id": "x"}] * 51}, "items", "too_many"),
+    ],
+)
+def test_approve_rejections(spending_app: SpendingApp, body: object, field: str, code: str) -> None:
+    before = spending_app.txns.read_bytes()
+    status, response = approve(spending_app, body)
+    assert (status, response["error"]["field"], response["error"]["code"]) == (422, field, code)
+    assert spending_app.txns.read_bytes() == before
+
+
+def test_approve_accepts_fifty_items(spending_app: SpendingApp) -> None:
+    status, body = approve(spending_app, {"items": [{"id": "x"}] * 50})
+    assert (status, len(body["results"])) == (200, 50)

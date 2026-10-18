@@ -15,9 +15,12 @@ from fava.beans.str import to_string
 from beancount_agent_api.core import (
     Accounts,
     AddRequest,
+    ApproveItem,
     Rejection,
     build_transaction,
+    flag_offset,
     parse_add_request,
+    parse_approve_request,
     parse_spending_request,
     spending,
 )
@@ -465,3 +468,40 @@ def test_spending_key_is_the_first_ik_link_by_name() -> None:
     )
     [listed] = spending([txn], [], "Expenses", datetime.date(2026, 10, 5))["transactions"]
     assert listed["key"] == "a"
+
+
+def test_parse_approve_request() -> None:
+    assert parse_approve_request(
+        {"items": [{"id": "a", "key": "k"}, {"id": "b", "key": None}, {"id": "c"}]}
+    ) == [ApproveItem("a", "k"), ApproveItem("b", None), ApproveItem("c", None)]
+    assert parse_approve_request({"items": []}) == []
+
+
+@pytest.mark.parametrize(
+    ("data", "lineno", "flag_at"),
+    [
+        (b'2026-10-05 ! "a ! b"\n  Expenses:A  1 TWD\n', 1, 11),
+        (b'2026-10-05\t!\t"a"\n', 1, 11),
+        (b"2026-10-05 !  ; note\n", 1, 11),
+        (b'x\r\n\r\n2026-10-05 ! "a"\r\n', 3, 16),
+        (b'x\n2026-10-05 ! "a"', 2, 13),
+        (b'\xef\xbb\xbf2026-10-05 ! "a"\n', 1, 14),
+    ],
+)
+def test_flag_offset_finds_the_header_flag(data: bytes, lineno: int, flag_at: int) -> None:
+    assert flag_offset(data, lineno) == flag_at
+    assert data[flag_at : flag_at + 1] == b"!"
+
+
+@pytest.mark.parametrize(
+    ("data", "lineno"),
+    [
+        (b'2026-10-05 * "a ! b"\n', 1),
+        (b'2026-10-05 !"a"\n', 1),
+        (b'  ! "a"\n', 1),
+        (b'2026-10-05 ! "a"\n', 2),
+        (b'2026-10-05 ! "a"', 3),
+    ],
+)
+def test_flag_offset_refuses_other_lines(data: bytes, lineno: int) -> None:
+    assert flag_offset(data, lineno) is None
