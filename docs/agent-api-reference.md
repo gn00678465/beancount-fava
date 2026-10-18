@@ -234,7 +234,7 @@ fava 寫入前不檢查整本帳。201 的 `errors` 是寫入前後 fava 的錯�
 | `transactions` | 那天有費用 posting 的交易，依帳本順序。只在資產與負債之間轉帳的交易不列出。費用帳戶是根名稱等於 `option "name_expenses"`（預設 `Expenses`）的帳戶。 |
 | `id` | fava 的 entry hash，可以傳給 `GET /<bfile>/api/source_slice?entry_hash=<id>`。只代表這個版本：交易的任何文字改變（包含核准時 flag 從 `!` 改成 `*`），或交易所在的檔名或行號改變（例如同一檔案中它前面多了一行）後，`id` 也會改變。跨次對應同一筆交易用 `key`。 |
 | `payee` | 沒有 payee 時是 `null`。 |
-| `key` | link `^ik-<key>` 去掉 `ik-` 的部分。沒有這種 link 時是 `null`。 |
+| `key` | link `^ik-<key>` 去掉 `ik-` 的部分。沒有這種 link 時是 `null`。交易有多個 `^ik-` link 時（例如在 fava 手動加上），取去掉 `ik-` 後依字母排序最前的一個，其他的不回傳。所以 `key` 不一定是當初新增這筆交易時送出的 key，也不代表交易全部的 link。`POST transactions` 只寫入一個 `^ik-` link。 |
 | `expenses` | 費用 posting，依帳本順序。 |
 | `funding` | 其餘 posting，依帳本順序。 |
 | `name_zh` | 帳戶 `open` 的 `name-zh` metadata。沒有時是 `null`。 |

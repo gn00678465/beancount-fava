@@ -447,3 +447,21 @@ def test_spending_numbers_never_use_an_exponent() -> None:
         "-1000",
     )
     assert body["month"]["total"] == [{"currency": "TWD", "number": "1000"}]
+
+
+def test_spending_key_is_the_first_ik_link_by_name() -> None:
+    txn = create.transaction(
+        meta={},
+        date=datetime.date(2026, 10, 5),
+        flag="!",
+        payee=None,
+        narration="",
+        tags=frozenset(),
+        links=frozenset({"ik-web-123", "ik-z", "ik-a", "a"}),
+        postings=[
+            create.posting("Expenses:Food", create.amount(Decimal(10), "TWD")),
+            create.posting("Assets:Cash", create.amount(Decimal(-10), "TWD")),
+        ],
+    )
+    [listed] = spending([txn], [], "Expenses", datetime.date(2026, 10, 5))["transactions"]
+    assert listed["key"] == "a"

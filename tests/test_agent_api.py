@@ -6,6 +6,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -841,6 +842,47 @@ def test_spending_sees_an_edit_to_the_file(spending_app: SpendingApp) -> None:
     assert ledger_errors == len(errors) > 0
 
 
+def test_spending_uses_the_ledger_root_for_expenses(tmp_path: Path) -> None:
+    ledger = tmp_path / "main.beancount"
+    ledger.write_text(
+        'option "title" "Spending"\n'
+        'option "operating_currency" "TWD"\n'
+        'option "name_expenses" "Costs"\n'
+        'option "name_income" "CostsBack"\n'
+        '2020-01-01 custom "fava-extension" "beancount_agent_api"\n'
+        "2026-01-01 open Assets:Cash TWD\n"
+        "2026-01-01 open Costs:Food TWD\n"
+        "2026-01-01 open CostsBack:Refund TWD\n"
+        '2026-10-05 ! "午餐"\n  Costs:Food  100 TWD\n  Assets:Cash\n'
+        '2026-10-05 * "退款"\n  CostsBack:Refund  -30 TWD\n  Assets:Cash\n',
+        encoding="utf-8",
+    )
+    app = SpendingApp(create_app([str(ledger)], poll_watcher=True), ledger)
+    # CostsBack shares the text prefix but is another root, so the refund is not listed.
+    body = app.without_ids("2026-10-05")
+    hundred = [{"currency": "TWD", "number": "100"}]
+    assert body == {
+        "date": "2026-10-05",
+        "transactions": [
+            {
+                "date": "2026-10-05",
+                "flag": "!",
+                "payee": None,
+                "narration": "午餐",
+                "key": None,
+                "expenses": [
+                    {"account": "Costs:Food", "name_zh": None, "number": "100", "currency": "TWD"}
+                ],
+                "funding": [
+                    {"account": "Assets:Cash", "name_zh": None, "number": "-100", "currency": "TWD"}
+                ],
+            }
+        ],
+        "month": {"month": "2026-10", "total": hundred, "pending": hundred},
+        "ledger_errors": 0,
+    }
+
+
 def test_spending_relies_on_fava_to_reload(spending_app: SpendingApp, monkeypatch: Any) -> None:
     spending_app.day("2026-10-05")
     calls = []
@@ -861,38 +903,43 @@ def test_spending_ignores_filters_of_concurrent_queries(spending_app: SpendingAp
     expected = spending_app.day("2026-10-05")
     client = spending_app.app.test_client()
     rows = client.get("/spending/api/query", query_string=query).json["data"]["rows"]
-    wrong = {"query": 0, "spending": 0}
     rounds = 200
-    barrier = threading.Barrier(3)
+    barrier = threading.Barrier(3, timeout=30)
 
-    def filtered_query() -> None:
+    def filtered_query() -> tuple[int, int]:
         client = spending_app.app.test_client()
         barrier.wait()
         for _ in range(rounds):
             client.get("/spending/api/query", query_string={**query, "time": "2019"})
+        return rounds, 0
 
-    def unfiltered_query() -> None:
+    def unfiltered_query() -> tuple[int, int]:
         # The control: fava's own query endpoint reads the other request's filter.
         client = spending_app.app.test_client()
         barrier.wait()
+        done = wrong = 0
         for _ in range(rounds):
             if client.get("/spending/api/query", query_string=query).json["data"]["rows"] != rows:
-                wrong["query"] += 1
+                wrong += 1
+            done += 1
+        return done, wrong
 
-    def read_spending() -> None:
+    def read_spending() -> tuple[int, int]:
         barrier.wait()
+        done = wrong = 0
         for _ in range(rounds):
             if spending_app.read({"date": "2026-10-05"}) != (200, expected):
-                wrong["spending"] += 1
+                wrong += 1
+            done += 1
+        return done, wrong
 
-    threads = [
-        threading.Thread(target=target)
-        for target in (filtered_query, unfiltered_query, read_spending)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(work) for work in (filtered_query, unfiltered_query, read_spending)]
+        # result() re-raises a worker's exception and bounds the wait.
+        (_, _), (query_done, query_wrong), (spending_done, spending_wrong) = [
+            future.result(timeout=120) for future in futures
+        ]
 
-    assert wrong["spending"] == 0
-    assert wrong["query"] > 0
+    assert (query_done, spending_done) == (rounds, rounds)
+    assert spending_wrong == 0
+    assert query_wrong > 0
