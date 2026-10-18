@@ -16,7 +16,7 @@ from fava.internal_api import get_ledger_data
 from fava.json_api import json_err, json_success
 from flask import Response, request
 
-from beancount_agent_api.core import REQUIRED
+from beancount_agent_api.core import MAX_TARGETS, REQUIRED
 
 if TYPE_CHECKING:
     from beancount_agent_api.extension import AgentApi
@@ -126,8 +126,10 @@ TOOLS = (
     ),
     Tool(
         "add_transaction",
-        "Add one transaction that moves amount from source to target. The entry is written "
-        "with the ! flag and a person approves it in fava. Send exactly one of date or time.",
+        "Add one transaction that moves amount from source to target, or that splits one "
+        "payment from source across several targets. The entry is written with the ! flag "
+        "and a person approves it in fava. Send exactly one of date or time, and either "
+        "target with amount or targets.",
         {
             "type": "object",
             "properties": {
@@ -144,6 +146,27 @@ TOOLS = (
                 "amount": _string(
                     'Positive decimal string with at most 2 decimals, such as "190".'
                 ),
+                "targets": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_TARGETS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "account": _string(
+                                "Expense account in the same forms as source; its root must be "
+                                'the ledger\'s option "name_expenses" (Expenses by default).'
+                            ),
+                            "amount": _string("Amount in the same form as amount."),
+                        },
+                        "required": ["account", "amount"],
+                        "additionalProperties": False,
+                    },
+                    "description": "Instead of target and amount: each expense account the "
+                    "payment goes to with its amount, in the order to write them. Each account "
+                    'must be under the ledger\'s option "name_expenses" and appear once; source '
+                    "pays the sum. For a single account that is not an expense, send target.",
+                },
                 "currency": _string(
                     "Currency code such as TWD; defaults to the ledger's operating currency."
                 ),

@@ -31,15 +31,21 @@ description: 在使用者的 beancount 帳本（fava）記帳與查帳。使用�
 
 ## 記一筆帳
 
-1. 查同一天、同金額的交易，例如 `SELECT date, flag, narration, account, position, links WHERE date = 2026-09-24 AND number = 190`。
+1. 查同一天、同金額的交易，例如 `SELECT date, flag, narration, account, position, links WHERE date = 2026-09-24 AND number = 190`。拆成多個費用時，以付款總額的負數查，例如 `number = -270.5`。
 2. 查詢結果有同日同額的交易時，列出該交易並問使用者是否仍要新增。不要寫入。
 3. 新增交易。帳戶由 fava 解析，不必先讀帳戶。
    - `source`：錢流出的帳戶，例如括號內的「錢包」。
    - `target`：錢流入的帳戶，例如「晚餐」。
+   - `targets`：一張收據要拆成多個費用時，改送 `targets`，不送 `target` 與 `amount`。例如晚餐 190、幫人代墊的午餐 80.5，都由錢包付：`"targets": [{"account": "晚餐", "amount": "190"}, {"account": "代墊", "amount": "80.5"}]`。
+     - 每一筆的 `account` 都必須是費用帳戶（`Expenses:` 開頭，或帳本設定的費用根），同一個帳戶只出現一次。
+     - 不送總額。付款帳戶的金額由各筆加總而來。
+     - 照使用者列出的順序送出。同一個 key 重送時順序不能改，否則會得到 409。
+     - 最多 20 筆。
+   - 選擇：只有一個帳戶時送 `target` 與 `amount`。錢流入的不是費用帳戶時（例如轉帳到另一個資產帳戶、收到的還款存進錢包），也送單一的 `target`，因為 `targets` 只接受費用帳戶。只有使用者明確要把一筆付款拆給多個費用時才送 `targets`。
    - 帳戶可以寫全名、完整的 `name-zh`，或 `name-zh` 的最後一段。照使用者的用詞送出，不要自己換成別的帳戶。
    - `date`：`YYYY-MM-DD`。使用者沒寫年份時用今年。
    - `time`：使用者給了時刻時，改送 `time`，格式是 RFC 3339 並帶 `+08:00`，例如 `2026-09-25T07:00:00+08:00`。`date` 與 `time` 只送一個。
-   - `amount`：正數字串，最多兩位小數，例如 `"190"`。
+   - `amount`：正數字串，最多兩位小數，例如 `"190"`。`targets` 每一筆的 `amount` 規則相同。
    - `narration`：使用者的描述，例如 `晚餐`。
    - `payee`：交易對象，例如代墊人。只有使用者提到時才送。
    - `tags`：字串陣列，只能用英數字與 `- _ / .`。中文要放 `meta`。只有使用者提到時才送。
@@ -59,6 +65,10 @@ description: 在使用者的 beancount 帳本（fava）記帳與查帳。使用�
 | 409 `key_conflict` | 這個 key 已用在另一筆交易。不要換 key 重送，先問使用者。 |
 | 422 `ambiguous_account` | `candidates` 列出候選帳戶。列出它們並問使用者要哪一個。 |
 | 422 `unknown_account` 或 `invalid_account_name` | 找不到帳戶。讀帳戶清單，告訴使用者找不到哪個帳戶，並列出相近的帳戶。不要猜。 |
+| 422 `not_expense_account` | `targets` 中的那個帳戶不是費用帳戶，`field` 指出是第幾筆，例如 `targets[1].account`。告訴使用者，並問要改成哪個費用帳戶，或把這筆另外以單一 `target` 記一筆。不要自己換帳戶。 |
+| 422 `duplicate_account` | `targets` 中有兩筆是同一個帳戶（別名也算）。問使用者是否合併成一筆金額，不要自己合併。 |
+| 422 `target_or_targets` | 同時送了 `targets` 與 `target` 或 `amount`。只留 `targets` 重送，沿用同一個 key。 |
+| 422 `too_many` | `targets` 超過 20 筆。告訴使用者，問要怎麼分成多筆交易。 |
 | 其他 422 | 依 `message` 修正該欄位後重送，沿用同一個 key。 |
 | 503 `busy`、逾時或連線中斷 | 以同一個 key 與同樣的欄位重送一次。 |
 | 401 | token 錯誤或沒有設定。請使用者檢查 `BEANCOUNT_AGENT_TOKEN`。 |

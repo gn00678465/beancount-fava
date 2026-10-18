@@ -17,6 +17,7 @@ from beancount_agent_api.core import (
     AddRequest,
     ApproveItem,
     Rejection,
+    Target,
     build_transaction,
     flag_offset,
     parse_add_request,
@@ -39,6 +40,7 @@ def accounts() -> Accounts:
         [entry for entry in entries if isinstance(entry, Open)],
         [entry for entry in entries if isinstance(entry, Close)],
         options["operating_currency"],
+        options["name_expenses"],
     )
 
 
@@ -57,8 +59,7 @@ def test_dinner_resolves_aliases(accounts: Accounts) -> None:
         date=datetime.date(2026, 9, 24),
         time=None,
         source="Assets:TW:Cash",
-        target="Expenses:Food:Dinner",
-        amount=Decimal(190),
+        targets=(Target("Expenses:Food:Dinner", Decimal(190)),),
         currency="TWD",
         narration="",
         payee=None,
@@ -88,7 +89,7 @@ def test_account_aliases(
 ) -> None:
     result = parse(accounts, source=source, target=target)
     assert isinstance(result, AddRequest), result
-    assert (result.source, result.target) == expected
+    assert (result.source, result.targets[0].account) == expected
 
 
 def test_shared_last_segment_lists_every_candidate(accounts: Accounts) -> None:
@@ -141,6 +142,7 @@ def test_invalid_account_name_opened_in_the_ledger() -> None:
         ],
         [],
         ["TWD"],
+        "Expenses",
     )
     assert parse(accounts, source="零錢", target="Expenses:Food") == Rejection(
         "source", "invalid_account_name", "Assets:Cash:錢包 is not a valid account name."
@@ -162,7 +164,7 @@ def test_bad_amounts(accounts: Accounts, amount: str) -> None:
 def test_good_amounts(accounts: Accounts, amount: str, expected: str) -> None:
     result = parse(accounts, amount=amount)
     assert isinstance(result, AddRequest), result
-    assert result.amount == Decimal(expected)
+    assert result.targets[0].amount == Decimal(expected)
 
 
 def test_amount_must_be_a_string(accounts: Accounts) -> None:
@@ -251,6 +253,102 @@ def test_render_dinner(accounts: Accounts) -> None:
         "  Expenses:Food:Dinner                                  190 TWD\n"
         "  Assets:TW:Cash                                       -190 TWD\n"
     )
+
+
+SPLIT = {
+    "date": "2026-09-24",
+    "source": "錢包",
+    "targets": [
+        {"account": "晚餐", "amount": "190"},
+        {"account": "公務/午餐", "amount": "80.5"},
+    ],
+    "key": "s1",
+}
+
+
+def parse_split(accounts: Accounts, **changes: object) -> AddRequest | Rejection:
+    raw = {**SPLIT, **changes}
+    return parse_add_request({k: v for k, v in raw.items() if v is not None}, accounts, TZ, TODAY)
+
+
+def test_render_split_keeps_the_request_order(accounts: Accounts) -> None:
+    result = parse_split(accounts)
+    assert isinstance(result, AddRequest), result
+    assert result.targets == (
+        Target("Expenses:Food:Dinner", Decimal(190)),
+        Target("Expenses:Work:Lunch", Decimal("80.5")),
+    )
+    assert to_string(build_transaction(result), 61, 2) == (
+        "2026-09-24 ! ^ik-s1\n"
+        "  Expenses:Food:Dinner                                  190 TWD\n"
+        "  Expenses:Work:Lunch                                  80.5 TWD\n"
+        "  Assets:TW:Cash                                     -270.5 TWD\n"
+    )
+
+
+def target(account: str, amount: object = "10") -> dict[str, object]:
+    return {"account": account, "amount": amount}
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        ({"target": "晚餐"}, ("target", "target_or_targets")),
+        ({"amount": "190"}, ("amount", "target_or_targets")),
+        ({"targets": None}, ("target", "missing")),
+        ({"targets": None, "target": "晚餐"}, ("amount", "missing")),
+        ({"targets": "晚餐"}, ("targets", "invalid_type")),
+        ({"targets": []}, ("targets", "missing")),
+        ({"targets": [target(f"a{i}") for i in range(21)]}, ("targets", "too_many")),
+        ({"targets": ["晚餐"]}, ("targets[0]", "invalid_type")),
+        ({"targets": [{**target("晚餐"), "note": "x"}]}, ("targets[0].note", "unknown_field")),
+        ({"targets": [target("晚餐"), {"account": "午餐"}]}, ("targets[1].amount", "missing")),
+        ({"targets": [{"amount": "1"}]}, ("targets[0].account", "missing")),
+        ({"targets": [target("晚餐", 10)]}, ("targets[0].amount", "invalid_type")),
+        (
+            {"targets": [target("晚餐"), target("公務/午餐", "0")]},
+            ("targets[1].amount", "invalid_amount"),
+        ),
+        (
+            {"targets": [target("晚餐"), target("Expenses:Food:Snack")]},
+            ("targets[1].account", "unknown_account"),
+        ),
+        (
+            {"targets": [target("晚餐"), target("錢包")]},
+            ("targets[1].account", "not_expense_account"),
+        ),
+        (
+            {"targets": [target("晚餐"), target("Equity:Opening-Balances")]},
+            ("targets[1].account", "not_expense_account"),
+        ),
+        (
+            {"source": "晚餐", "targets": [target("公務/午餐"), target("Expenses:Food:Dinner")]},
+            ("targets[1].account", "same_account"),
+        ),
+        (
+            {"targets": [target("晚餐"), target("Expenses:Food:Dinner")]},
+            ("targets[1].account", "duplicate_account"),
+        ),
+        ({"currency": "USD"}, ("currency", "currency_not_allowed")),
+    ],
+)
+def test_split_rejections(
+    accounts: Accounts, changes: dict[str, object], expected: tuple[str, str]
+) -> None:
+    assert code(parse_split(accounts, **changes)) == expected
+
+
+def test_single_target_may_be_any_account(accounts: Accounts) -> None:
+    result = parse(accounts, target="Equity:Opening-Balances")
+    assert isinstance(result, AddRequest), result
+    assert result.targets == (Target("Equity:Opening-Balances", Decimal(190)),)
+
+
+def test_twenty_targets_are_accepted(accounts: Accounts) -> None:
+    targets = [target("晚餐"), *(target(f"Expenses:Food:Dinner{i}") for i in range(19))]
+    result = parse_split(accounts, targets=targets)
+    # The 20 items pass the count check and reach account resolution.
+    assert code(result) == ("targets[1].account", "unknown_account")
 
 
 def test_render_with_time_and_narration(accounts: Accounts) -> None:
