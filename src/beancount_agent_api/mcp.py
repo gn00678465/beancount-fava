@@ -153,15 +153,19 @@ TOOLS = (
                     "items": {
                         "type": "object",
                         "properties": {
-                            "account": _string("Account in the same forms as source."),
+                            "account": _string(
+                                "Expense account in the same forms as source; its root must be "
+                                'the ledger\'s option "name_expenses" (Expenses by default).'
+                            ),
                             "amount": _string("Amount in the same form as amount."),
                         },
                         "required": ["account", "amount"],
                         "additionalProperties": False,
                     },
-                    "description": "Instead of target and amount: each account the payment "
-                    "goes to with its amount, in the order to write them. Each account appears "
-                    "once; source pays the sum.",
+                    "description": "Instead of target and amount: each expense account the "
+                    "payment goes to with its amount, in the order to write them. Each account "
+                    'must be under the ledger\'s option "name_expenses" and appear once; source '
+                    "pays the sum. For a single account that is not an expense, send target.",
                 },
                 "currency": _string(
                     "Currency code such as TWD; defaults to the ledger's operating currency."

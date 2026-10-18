@@ -466,6 +466,13 @@ def test_mcp_add_transaction_with_payee_tags_meta(in_process: InProcess) -> None
     )
 
 
+def test_mcp_schema_says_targets_are_expense_accounts(in_process: InProcess) -> None:
+    tools = {tool["name"]: tool for tool in in_process.result(rpc("tools/list"))["tools"]}
+    targets = tools["add_transaction"]["inputSchema"]["properties"]["targets"]
+    assert "name_expenses" in targets["description"]
+    assert "name_expenses" in targets["items"]["properties"]["account"]["description"]
+
+
 def test_mcp_schema_lists_every_request_field(in_process: InProcess) -> None:
     tools = {tool["name"]: tool for tool in in_process.result(rpc("tools/list"))["tools"]}
     assert set(tools["add_transaction"]["inputSchema"]["properties"]) == set(FIELDS)
