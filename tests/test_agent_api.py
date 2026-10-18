@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -704,6 +704,40 @@ def spending_app(tmp_path: Path) -> SpendingApp:
     return SpendingApp(app, tmp_path / "ledger" / "txns.beancount")
 
 
+class Background:
+    """Runs one work on a daemon thread.
+
+    A ThreadPoolExecutor joins its threads on exit and at interpreter shutdown, so a stuck
+    work would hang the run past any result() timeout. A daemon thread holds up neither.
+    """
+
+    def __init__(self, work: Callable[[], Any]) -> None:
+        self._outcome: tuple[bool, Any] | None = None
+        self._thread = threading.Thread(target=self._run, args=(work,), daemon=True)
+        self._thread.start()
+
+    def _run(self, work: Callable[[], Any]) -> None:
+        try:
+            self._outcome = (True, work())
+        except BaseException as error:  # noqa: BLE001  # re-raised in result()
+            self._outcome = (False, error)
+
+    def result(self, deadline: float) -> Any:
+        self._thread.join(max(0.0, deadline - time.monotonic()))
+        if self._thread.is_alive() or self._outcome is None:
+            pytest.fail("a background work did not finish before the deadline")
+        ok, value = self._outcome
+        if not ok:
+            raise value
+        return value
+
+
+def run_together(*works: Callable[[], Any], timeout: float) -> list[Any]:
+    started = [Background(work) for work in works]
+    deadline = time.monotonic() + timeout
+    return [work.result(deadline) for work in started]
+
+
 def test_spending_lists_the_day_and_sums_the_month(spending_app: SpendingApp) -> None:
     # The cash withdrawal on 2026-10-05 has no expense posting, so it is not listed.
     assert spending_app.without_ids("2026-10-05") == {
@@ -901,14 +935,13 @@ def test_spending_during_another_reload_is_old_until_the_next_read(
         return load(*args, **kwargs)
 
     monkeypatch.setattr(fava_core, "load_uncached", held_load)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        other = pool.submit(spending_app.app.test_client().get, "/spending/income_statement/")
-        try:
-            assert loading.wait(30)
-            during = spending_app.day("2026-10-06")
-        finally:
-            release.set()
-        assert other.result(timeout=30).status_code == 200
+    other = Background(lambda: spending_app.app.test_client().get("/spending/income_statement/"))
+    try:
+        assert loading.wait(30)
+        during = spending_app.day("2026-10-06")
+    finally:
+        release.set()
+    assert other.result(time.monotonic() + 30).status_code == 200
 
     assert (during["transactions"], during["month"]["total"][0]["number"]) == ([], "680")
     after = spending_app.day("2026-10-06")
@@ -968,12 +1001,9 @@ def test_spending_ignores_filters_of_concurrent_queries(spending_app: SpendingAp
             done += 1
         return done, wrong
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = [pool.submit(work) for work in (filtered_query, unfiltered_query, read_spending)]
-        # result() re-raises a worker's exception and bounds the wait.
-        (_, _), (query_done, query_wrong), (spending_done, spending_wrong) = [
-            future.result(timeout=120) for future in futures
-        ]
+    (_, _), (query_done, query_wrong), (spending_done, spending_wrong) = run_together(
+        filtered_query, unfiltered_query, read_spending, timeout=120
+    )
 
     assert (query_done, spending_done) == (rounds, rounds)
     assert spending_wrong == 0
