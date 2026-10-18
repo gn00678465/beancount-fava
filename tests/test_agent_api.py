@@ -1146,14 +1146,13 @@ def test_approve_during_another_reload_never_edits_another_entry(
 
     monkeypatch.setattr(fava_core, "load_uncached", held_load)
     items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        other = pool.submit(spending_app.app.test_client().get, "/spending/income_statement/")
-        try:
-            assert loading.wait(30)
-            status, body = approve(spending_app, {"items": items})
-        finally:
-            release.set()
-        assert other.result(timeout=30).status_code == 200
+    other = Background(lambda: spending_app.app.test_client().get("/spending/income_statement/"))
+    try:
+        assert loading.wait(30)
+        status, body = approve(spending_app, {"items": items})
+    finally:
+        release.set()
+    assert other.result(time.monotonic() + 30).status_code == 200
 
     assert (status, [result["result"] for result in body["results"]]) == (200, ["stale", "stale"])
     assert spending_app.txns.read_text(encoding="utf-8") == moved
@@ -1195,10 +1194,7 @@ def test_approve_and_add_concurrently(spending_app: SpendingApp) -> None:
             results.append(body["results"][0]["result"])
         return results
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        adding, approving = pool.submit(add), pool.submit(approve_each)
-        # result() re-raises a worker's exception and bounds the wait.
-        statuses, results = adding.result(timeout=120), approving.result(timeout=120)
+    statuses, results = run_together(add, approve_each, timeout=120)
 
     text = spending_app.txns.read_text(encoding="utf-8")
     assert (statuses, results) == ([201] * 20, ["approved"] * 4)

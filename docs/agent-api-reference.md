@@ -325,6 +325,8 @@ flowchart TD
 
 寫入用 fava 的 `save_entry_slice`，與 fava 網頁編輯交易是同一個方法。寫入前解析檔案中那幾行，檢查日期、flag、payee、narration、帳戶與寫出的金額都與帳本中的交易相同，寫出的 tag 與 link 也都在交易上，避免檔案改過之後改到別筆交易。tag 只檢查寫出的部分，因為 `pushtag` 加上的 tag 不在那幾行中。寫入鎖與 `POST transactions` 共用，所以兩者不會同時寫檔。全部處理完後重新載入一次 ledger。
 
+核准與 `POST spending` 一樣，不等其他請求的重新載入完成。另一個請求正在重新載入時，核准看到的是重新載入前的帳本與行號；那幾行對不上的交易回 `stale`，不會改到別筆。網頁重新讀取 `POST spending` 後，以新的 `id` 再送一次。
+
 ### 回應
 
 | 狀態 | body | 意思 |
