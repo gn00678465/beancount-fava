@@ -124,7 +124,9 @@ class AgentApi(FavaExtensionBase):
             if approved is None:
                 return None
             self.ledger.file.save_entry_slice(hash_entry(entry), approved, sha256sum)
-        except FavaAPIError:
+        # fava reads the lines at the line number of its last load; IndexError means the file
+        # has since become shorter than that.
+        except (FavaAPIError, IndexError):
             return None
         return hash_entry(entry._replace(flag="*"))
 

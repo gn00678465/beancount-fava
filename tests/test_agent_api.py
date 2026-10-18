@@ -1121,19 +1121,12 @@ def test_approve_twice_in_one_request(spending_app: SpendingApp) -> None:
     assert spending_app.txns.read_text(encoding="utf-8").count('2026-10-05 * "全聯"') == 2
 
 
-def test_approve_during_another_reload_never_edits_another_entry(
-    spending_app: SpendingApp, monkeypatch: Any
-) -> None:
-    ids = pending_ids(spending_app, "2026-10-05", "2026-08-10")
-    text = spending_app.txns.read_text(encoding="utf-8")
-    header = '2026-10-05 ! "全聯" "採買與晚餐"'
-    inserted = '2026-10-05 ! "插入"\n  Expenses:Food:Dinner  10 TWD\n  Assets:TW:Cash\n\n'
-    moved = text.replace(header, inserted + header)
-    spending_app.txns.write_text(moved, encoding="utf-8")
+def during_another_reload(app: SpendingApp, monkeypatch: Any, action: Callable[[], Any]) -> Any:
+    """Run action while another request is held inside load_file.
 
-    # Hold another request inside load_file, after fava's watcher has handed it the change.
-    # The approval then sees the old line numbers: the first one now points at the inserted
-    # pending entry.
+    fava's watcher has already handed that request the change, so action sees the ledger and
+    line numbers from before the change.
+    """
     loading, release = threading.Event(), threading.Event()
     load = fava_core.load_uncached
 
@@ -1145,15 +1138,31 @@ def test_approve_during_another_reload_never_edits_another_entry(
         return load(*args, **kwargs)
 
     monkeypatch.setattr(fava_core, "load_uncached", held_load)
-    items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
-    other = Background(lambda: spending_app.app.test_client().get("/spending/income_statement/"))
+    other = Background(lambda: app.app.test_client().get("/spending/income_statement/"))
     try:
         assert loading.wait(30)
-        status, body = approve(spending_app, {"items": items})
+        outcome = action()
     finally:
         release.set()
     assert other.result(time.monotonic() + 30).status_code == 200
+    return outcome
 
+
+def test_approve_during_another_reload_never_edits_another_entry(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    ids = pending_ids(spending_app, "2026-10-05", "2026-08-10")
+    text = spending_app.txns.read_text(encoding="utf-8")
+    header = '2026-10-05 ! "全聯" "採買與晚餐"'
+    inserted = '2026-10-05 ! "插入"\n  Expenses:Food:Dinner  10 TWD\n  Assets:TW:Cash\n\n'
+    moved = text.replace(header, inserted + header)
+    spending_app.txns.write_text(moved, encoding="utf-8")
+
+    # The first old line number now points at the inserted pending entry.
+    items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
+    status, body = during_another_reload(
+        spending_app, monkeypatch, lambda: approve(spending_app, {"items": items})
+    )
     assert (status, [result["result"] for result in body["results"]]) == (200, ["stale", "stale"])
     assert spending_app.txns.read_text(encoding="utf-8") == moved
 
@@ -1164,6 +1173,22 @@ def test_approve_during_another_reload_never_edits_another_entry(
     assert spending_app.txns.read_text(encoding="utf-8") == moved.replace(
         '2026-10-05 ! "全聯"', '2026-10-05 * "全聯"'
     ).replace('2026-08-10 ! "小明"', '2026-08-10 * "小明"')
+
+
+def test_approve_during_another_reload_after_the_file_shrank(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    ids = pending_ids(spending_app, "2026-10-05", "2026-08-10")
+    shrunk = spending_app.txns.read_text(encoding="utf-8").split("\n\n")[0] + "\n"
+    spending_app.txns.write_text(shrunk, encoding="utf-8")
+
+    # The old line numbers now point past the end of the file.
+    items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
+    status, body = during_another_reload(
+        spending_app, monkeypatch, lambda: approve(spending_app, {"items": items})
+    )
+    assert (status, [result["result"] for result in body["results"]]) == (200, ["stale", "stale"])
+    assert spending_app.txns.read_text(encoding="utf-8") == shrunk
 
 
 def test_approve_and_add_concurrently(spending_app: SpendingApp) -> None:
