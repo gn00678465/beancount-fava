@@ -1121,7 +1121,9 @@ def test_approve_twice_in_one_request(spending_app: SpendingApp) -> None:
     assert spending_app.txns.read_text(encoding="utf-8").count('2026-10-05 * "全聯"') == 2
 
 
-def test_approve_after_the_lines_moved(spending_app: SpendingApp, monkeypatch: Any) -> None:
+def test_approve_during_another_reload_never_edits_another_entry(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
     ids = pending_ids(spending_app, "2026-10-05", "2026-08-10")
     text = spending_app.txns.read_text(encoding="utf-8")
     header = '2026-10-05 ! "全聯" "採買與晚餐"'
@@ -1129,16 +1131,33 @@ def test_approve_after_the_lines_moved(spending_app: SpendingApp, monkeypatch: A
     moved = text.replace(header, inserted + header)
     spending_app.txns.write_text(moved, encoding="utf-8")
 
-    # Another request thread has claimed the reload, so the ledger still has the old line
-    # numbers: the first one now points at the inserted pending entry.
-    changed = FavaLedger.changed
-    monkeypatch.setattr(FavaLedger, "changed", lambda _: False)
+    # Hold another request inside load_file, after fava's watcher has handed it the change.
+    # The approval then sees the old line numbers: the first one now points at the inserted
+    # pending entry.
+    loading, release = threading.Event(), threading.Event()
+    load = fava_core.load_uncached
+
+    def held_load(*args: Any, **kwargs: Any) -> Any:
+        # Only the other request's load is held; a reload after a write passes through.
+        if not loading.is_set():
+            loading.set()
+            assert release.wait(30)
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(fava_core, "load_uncached", held_load)
     items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
-    status, body = approve(spending_app, {"items": items})
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        other = pool.submit(spending_app.app.test_client().get, "/spending/income_statement/")
+        try:
+            assert loading.wait(30)
+            status, body = approve(spending_app, {"items": items})
+        finally:
+            release.set()
+        assert other.result(timeout=30).status_code == 200
+
     assert (status, [result["result"] for result in body["results"]]) == (200, ["stale", "stale"])
     assert spending_app.txns.read_text(encoding="utf-8") == moved
 
-    monkeypatch.setattr(FavaLedger, "changed", changed)
     ids = pending_ids(spending_app, "2026-10-05", "2026-08-10")
     items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
     status, body = approve(spending_app, {"items": items})
@@ -1151,13 +1170,12 @@ def test_approve_after_the_lines_moved(spending_app: SpendingApp, monkeypatch: A
 def test_approve_and_add_concurrently(spending_app: SpendingApp) -> None:
     ids = pending_ids(spending_app, "2026-10-05", "2026-08-10", "2026-08-11")
     pending = [ids[name] for name in ("採買與晚餐", "訂金", "代墊午餐", "停車")]
-    results: list[str] = []
-    statuses: list[int] = []
-    barrier = threading.Barrier(2)
+    barrier = threading.Barrier(2, timeout=30)
 
-    def add() -> None:
+    def add() -> list[int]:
         client = spending_app.app.test_client()
         barrier.wait()
+        statuses = []
         for n in range(20):
             body = {"date": "2026-10-06", "source": "錢包", "target": "晚餐", "amount": "5"}
             response = client.post(
@@ -1166,19 +1184,21 @@ def test_approve_and_add_concurrently(spending_app: SpendingApp) -> None:
                 content_type="application/json",
             )
             statuses.append(response.status_code)
+        return statuses
 
-    def approve_each() -> None:
+    def approve_each() -> list[str]:
         barrier.wait()
+        results = []
         for id_ in pending:
             status, body = approve(spending_app, {"items": [{"id": id_}]})
             assert status == 200
             results.append(body["results"][0]["result"])
+        return results
 
-    threads = [threading.Thread(target=add), threading.Thread(target=approve_each)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        adding, approving = pool.submit(add), pool.submit(approve_each)
+        # result() re-raises a worker's exception and bounds the wait.
+        statuses, results = adding.result(timeout=120), approving.result(timeout=120)
 
     text = spending_app.txns.read_text(encoding="utf-8")
     assert (statuses, results) == ([201] * 20, ["approved"] * 4)
