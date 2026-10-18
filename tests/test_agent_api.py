@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import fava.core as fava_core
 import pytest
 from conftest import AGENT_TOKEN, REPO, docker, ledger_volume_of, running_fava
 from fava.application import create_app
@@ -881,6 +882,40 @@ def test_spending_uses_the_ledger_root_for_expenses(tmp_path: Path) -> None:
         "month": {"month": "2026-10", "total": hundred, "pending": hundred},
         "ledger_errors": 0,
     }
+
+
+def test_spending_during_another_reload_is_old_until_the_next_read(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    assert spending_app.day("2026-10-06")["month"]["total"][0]["number"] == "680"
+    with spending_app.txns.open("a", encoding="utf-8") as txns:
+        txns.write('\n2026-10-06 * "咖啡"\n  Expenses:Food:Dinner  60 TWD\n  Assets:TW:Cash\n')
+
+    # Hold another request inside load_file, after fava's watcher has handed it the change.
+    loading, release = threading.Event(), threading.Event()
+    load = fava_core.load_uncached
+
+    def held_load(*args: Any, **kwargs: Any) -> Any:
+        loading.set()
+        assert release.wait(30)
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(fava_core, "load_uncached", held_load)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        other = pool.submit(spending_app.app.test_client().get, "/spending/income_statement/")
+        try:
+            assert loading.wait(30)
+            during = spending_app.day("2026-10-06")
+        finally:
+            release.set()
+        assert other.result(timeout=30).status_code == 200
+
+    assert (during["transactions"], during["month"]["total"][0]["number"]) == ([], "680")
+    after = spending_app.day("2026-10-06")
+    assert (
+        [txn["narration"] for txn in after["transactions"]],
+        after["month"]["total"][0]["number"],
+    ) == (["咖啡"], "740")
 
 
 def test_spending_relies_on_fava_to_reload(spending_app: SpendingApp, monkeypatch: Any) -> None:
