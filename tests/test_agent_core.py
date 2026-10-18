@@ -3,7 +3,6 @@ from __future__ import annotations
 import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
 from zoneinfo import ZoneInfo
 
 import fava.core  # noqa: F401  # fava.beans.str raises a circular ImportError unless fava.core loads first
@@ -18,8 +17,8 @@ from beancount_agent_api.core import (
     AddRequest,
     ApproveItem,
     Rejection,
-    approved_slice,
     build_transaction,
+    flag_offset,
     parse_add_request,
     parse_approve_request,
     parse_spending_request,
@@ -478,42 +477,31 @@ def test_parse_approve_request() -> None:
     assert parse_approve_request({"items": []}) == []
 
 
-PENDING = (
-    '2026-10-05 ! "店 ! 家" "! 注意" #a ^ik-k\n'
-    '  note: "x ! y"\n'
-    "  Expenses:Food:Dinner                                  150 TWD\n"
-    "  Assets:TW:Cash"
+@pytest.mark.parametrize(
+    ("data", "lineno", "flag_at"),
+    [
+        (b'2026-10-05 ! "a ! b"\n  Expenses:A  1 TWD\n', 1, 11),
+        (b'2026-10-05\t!\t"a"\n', 1, 11),
+        (b"2026-10-05 !  ; note\n", 1, 11),
+        (b'x\r\n\r\n2026-10-05 ! "a"\r\n', 3, 16),
+        (b'x\n2026-10-05 ! "a"', 2, 13),
+        (b'\xef\xbb\xbf2026-10-05 ! "a"\n', 1, 14),
+    ],
 )
-
-
-def pending_entry(source: str = PENDING) -> Any:
-    entries, errors, _ = loader.load_string(
-        "2026-01-01 open Expenses:Food:Dinner\n2026-01-01 open Assets:TW:Cash\n" + source
-    )
-    assert errors == []
-    return entries[-1]
-
-
-def test_approved_slice_changes_only_the_header_flag() -> None:
-    assert approved_slice(PENDING, pending_entry()) == PENDING.replace(" ! ", " * ", 1)
+def test_flag_offset_finds_the_header_flag(data: bytes, lineno: int, flag_at: int) -> None:
+    assert flag_offset(data, lineno) == flag_at
+    assert data[flag_at : flag_at + 1] == b"!"
 
 
 @pytest.mark.parametrize(
-    "source",
+    ("data", "lineno"),
     [
-        PENDING.replace("150 TWD", "160 TWD"),
-        PENDING.replace("Assets:TW:Cash", "Assets:TW:Bank"),
-        PENDING.replace("! 注意", "注意"),
-        PENDING.replace("2026-10-05", "2026-10-06"),
-        PENDING.replace(" ! ", " * ", 1),
-        PENDING + "\n  Assets:TW:Bank  0 TWD",
-        "2026-10-05 ! oops",
+        (b'2026-10-05 * "a ! b"\n', 1),
+        (b'2026-10-05 !"a"\n', 1),
+        (b'  ! "a"\n', 1),
+        (b'2026-10-05 ! "a"\n', 2),
+        (b'2026-10-05 ! "a"', 3),
     ],
 )
-def test_approved_slice_refuses_other_lines(source: str) -> None:
-    assert approved_slice(source, pending_entry()) is None
-
-
-def test_approved_slice_allows_pushed_tags() -> None:
-    entry = pending_entry("pushtag #trip\n" + PENDING + "\npoptag #trip")
-    assert approved_slice(PENDING, entry) == PENDING.replace(" ! ", " * ", 1)
+def test_flag_offset_refuses_other_lines(data: bytes, lineno: int) -> None:
+    assert flag_offset(data, lineno) is None

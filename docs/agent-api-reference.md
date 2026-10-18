@@ -293,11 +293,20 @@ fava 在處理 extension 的請求之前會檢查 ledger 檔有沒有改變，�
 
 | `result` | 意思 |
 |---|---|
-| `approved` | 已從 `!` 改成 `*`。`new_id` 是核准後的 `id`。 |
+| `approved` | 已從 `!` 改成 `*`，並已讀回確認。`new_id` 是核准後的 `id`。 |
 | `already` | 那筆交易已是 `*`：以 `id` 找到的交易已是 `*`，或 `id` 找不到但以 `key` 找到的交易已是 `*`。 |
-| `stale` | 帳本上沒有使用者看到的那個版本。可能是 `id` 找不到又沒有 `key`、以 `key` 找到的交易仍是 `!` 但內容或位置已改變，或檔案在讀取與寫入之間被改過。重新讀取 `POST spending`，再讓使用者決定。 |
+| `stale` | 帳本上沒有使用者看到的那個版本，沒有寫入。可能是 `id` 找不到又沒有 `key`、以 `key` 找到的交易仍是 `!` 但內容或位置已改變，或檔案在核准讀取之後、寫入之前被改過。重新讀取 `POST spending`，再讓使用者決定。 |
 | `not_found` | `id` 找不到，以 `key` 也找不到交易。 |
 | `not_pending` | 找到了，但 flag 不是 `!` 也不是 `*`。 |
+| `error` | 結果未知：寫入或讀回時發生 I/O 錯誤，或讀回的內容不是預期的內容。那筆可能已核准，也可能沒有。`message` 寫出檔案與位元組位置。重新讀取 `POST spending`，並在 fava 檢查那個檔案。 |
+
+`error` 的 `message` 範例：
+
+```text
+/ledger/txns.beancount at byte 1234 did not read back as approved: another program wrote the file while the flag was written. That byte may now be a stray * in the other program's text, and it is not restored; check the file in fava.
+```
+
+讀回不符表示另一個程式剛好在寫入的瞬間存了檔。若它是原地存檔，`*` 會寫進它的新內容中同一個位元組位置，取代原本的字元。這個位元組不會自動復原，要在 fava 打開那個檔案，檢查那個位置。
 
 ### 處理順序
 
@@ -307,8 +316,9 @@ flowchart TD
     Valid -->|否| R422["422 與 error.code"]
     Valid -->|是| Lock{"10 秒內取得寫入鎖？"}
     Lock -->|否| R503["503 busy"]
-    Lock -->|是| Reload["重新載入 ledger"]
-    Reload --> Each["依序處理每一筆"]
+    Lock -->|是| Load{"載入帳本，載入前後<br>檔案的位元組相同？"}
+    Load -->|試 3 次都不同| R503
+    Load -->|是| Each["依序處理每一筆"]
     Each --> ById{"以 id 找到？"}
     ById -->|否，沒有 key| Stale["stale"]
     ById -->|否，有 key| ByKey{"以 ^ik-&lt;key&gt; 找到？"}
@@ -318,14 +328,29 @@ flowchart TD
     ById -->|是| Flag{"flag？"}
     Flag -->|*| Already["already"]
     Flag -->|! 以外| NotPending["not_pending"]
-    Flag -->|!| Lines{"檔案中那幾行<br>仍是這筆交易？"}
-    Lines -->|否| Stale
-    Lines -->|是| Write["把首行的 ! 改成 *"] --> Approved["approved"]
+    Flag -->|!| Same{"檔案仍與<br>載入時相同？"}
+    Same -->|否| Stale
+    Same -->|是| Write["把 flag 那一個位元組<br>改成 *"]
+    Write --> Back{"讀回是預期的內容？"}
+    Back -->|是| Approved["approved"]
+    Back -->|否，或 I/O 錯誤| Error["error"]
 ```
 
-寫入用 fava 的 `save_entry_slice`，與 fava 網頁編輯交易是同一個方法。寫入前解析檔案中那幾行，檢查日期、flag、payee、narration、帳戶與寫出的金額都與帳本中的交易相同，寫出的 tag 與 link 也都在交易上，避免檔案改過之後改到別筆交易。tag 只檢查寫出的部分，因為 `pushtag` 加上的 tag 不在那幾行中。寫入鎖與 `POST transactions` 共用，所以兩者不會同時寫檔。全部處理完後重新載入一次 ledger。
+核准不使用 fava 記憶體中的帳本，因為另一個請求正在重新載入時，那份帳本可能還是舊的（見 `POST spending`）。核准在寫入鎖內自己載入一次帳本，並在載入前後各讀一次所有檔案的位元組。兩次相同，這次載入的交易才對應到磁碟上的內容；否則重試，最多 3 次。
 
-核准與 `POST spending` 一樣，不等其他請求的重新載入完成。另一個請求正在重新載入時，核准看到的是重新載入前的帳本與行號；那幾行對不上的交易回 `stale`，不會改到別筆。網頁重新讀取 `POST spending` 後，以新的 `id` 再送一次。
+`id` 是 fava 的 entry hash，涵蓋交易的全部內容，包含 metadata、tag、link、cost、price、檔名與行號。只有使用者看到的那個版本會符合。內容改過，或同一位置換成了另一筆相似的交易，都回 `stale`。
+
+寫入時只改 flag 那一個位元組。檔案的其他位元組都不變，包括換行字元（LF 或 CRLF）與檔尾有沒有換行。檔案的 inode、擁有者與權限也不變。寫入後再以路徑讀回整個檔案，確認只有那一個位元組改變。全部處理完後重新載入一次 fava 的 ledger。
+
+### 與其他寫入者的同步
+
+| 寫入者 | 保證 |
+|---|---|
+| 同一個 fava process 內的寫入：`POST approve`、`POST transactions`、fava 網頁的編輯與存檔 | 彼此不會覆蓋。前兩者共用 API 的寫入鎖，寫入時另外持有 fava 自己的檔案鎖。 |
+| 外部編輯器在核准讀取檔案之前存的內容 | 都會保留。核准發現檔案與載入時不同，就回 `stale`，不寫入。 |
+| 外部編輯器剛好在核准寫入的瞬間存檔 | 核准可能把 `*` 寫到錯的位置，或核准遺失。這種情況回 `error`，不回 `approved`。網頁要重新讀取，並請使用者在 fava 檢查那個檔案。 |
+
+外部編輯器不使用任何鎖，所以沒有方法完全排除最後一種情況。不要在核准的同時，用外部編輯器編輯同一個檔案。
 
 ### 回應
 
@@ -333,7 +358,7 @@ flowchart TD
 |---|---|---|
 | 200 | `{"results", "ledger_errors"}` | 每一筆的結果。`ledger_errors` 是處理完後 fava 的帳本錯誤數量。 |
 | 422 | `{"error": {...}}` | 請求不符合規則。`error` 的格式同 `POST transactions`，`code` 見下表。 |
-| 503 | `{"error": {...}}` | `code` 是 `busy`。另一筆寫入還沒完成。以同樣的 body 重送。 |
+| 503 | `{"error": {...}}` | `code` 是 `busy`。另一筆寫入還沒完成，或載入帳本時檔案一直在改變。以同樣的 body 重送。 |
 
 | 422 的 `code` | `field` | 原因 |
 |---|---|---|

@@ -9,7 +9,7 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import fava.core as fava_core
 import pytest
@@ -17,6 +17,7 @@ from conftest import AGENT_TOKEN, REPO, docker, ledger_volume_of, running_fava
 from fava.application import create_app
 from fava.core import FavaLedger
 
+from beancount_agent_api import extension
 from beancount_agent_api.core import FIELDS
 
 AGENT_LEDGER = REPO / "tests" / "fixtures" / "agent-ledger"
@@ -1189,6 +1190,242 @@ def test_approve_during_another_reload_after_the_file_shrank(
     )
     assert (status, [result["result"] for result in body["results"]]) == (200, ["stale", "stale"])
     assert spending_app.txns.read_text(encoding="utf-8") == shrunk
+
+
+def edit_after_load(monkeypatch: Any, edit: Callable[[], None]) -> None:
+    """Run edit once, right after approve's own load of the ledger."""
+    load = extension.load_uncached
+    edits = [edit]
+
+    def load_then_edit(*args: Any, **kwargs: Any) -> Any:
+        loaded = load(*args, **kwargs)
+        while edits:
+            edits.pop()()
+        return loaded
+
+    monkeypatch.setattr(extension, "load_uncached", load_then_edit)
+
+
+@pytest.mark.parametrize(
+    ("name", "old", "new"),
+    [
+        ("代墊午餐", '  note: "還代墊"', '  note: "另一筆"'),
+        ("代墊午餐", "#reimburse ^ik-lunch", "^ik-lunch"),
+        ("訂金", "10.50 USD @ 32.1 TWD", "10.50 USD @ 40 TWD"),
+    ],
+)
+@pytest.mark.parametrize("when", ["during another reload", "during approve"])
+def test_approve_refuses_a_changed_version(
+    spending_app: SpendingApp, monkeypatch: Any, name: str, old: str, new: str, when: str
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05", "2026-08-10")[name]
+    changed = spending_app.txns.read_text(encoding="utf-8").replace(old, new)
+    assert changed != spending_app.txns.read_text(encoding="utf-8")
+
+    def edit() -> None:
+        spending_app.txns.write_text(changed, encoding="utf-8")
+
+    def send() -> Any:
+        return approve(spending_app, {"items": [{"id": id_}]})
+
+    if when == "during another reload":
+        # fava's ledger still has the old version at the same line.
+        edit()
+        status, body = during_another_reload(spending_app, monkeypatch, send)
+    else:
+        edit_after_load(monkeypatch, edit)
+        status, body = send()
+    assert (status, body["results"][0]["result"]) == (200, "stale")
+    assert spending_app.txns.read_text(encoding="utf-8") == changed
+
+
+def test_approve_refuses_a_similar_entry_at_the_old_line(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    text = spending_app.txns.read_text(encoding="utf-8")
+    header = '2026-10-05 ! "全聯" "採買與晚餐" ^ik-web-123\n'
+    body_lines = text.split(header, 1)[1].split("\n\n", 1)[0]
+    # The same entry without the link, inserted where the original started.
+    twin = '2026-10-05 ! "全聯" "採買與晚餐"\n' + body_lines + "\n\n"
+    moved = text.replace(header, twin + header)
+    spending_app.txns.write_text(moved, encoding="utf-8")
+
+    # fava's ledger still points the id at the old line, where the twin now starts.
+    status, body = during_another_reload(
+        spending_app, monkeypatch, lambda: approve(spending_app, {"items": [{"id": id_}]})
+    )
+    assert (status, body["results"][0]["result"]) == (200, "stale")
+    assert spending_app.txns.read_text(encoding="utf-8") == moved
+
+
+def test_approve_keeps_an_append_made_after_its_load(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    appended = "; written by an editor\n"
+
+    def append() -> None:
+        with spending_app.txns.open("a", encoding="utf-8") as txns:
+            txns.write(appended)
+
+    edit_after_load(monkeypatch, append)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"]) == (200, "approved")
+    text = spending_app.txns.read_text(encoding="utf-8")
+    assert text.endswith(appended)
+    assert '2026-10-05 * "全聯" "採買與晚餐" ^ik-web-123' in text
+
+
+@pytest.mark.parametrize(
+    "header",
+    ['2026-10-05\t!\t"Tab"', '2026-10-05  !  "Spaces"  ; note', '2026-10-05 ! "Plain"'],
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("final_newline", [True, False])
+def test_approve_changes_one_byte_in_any_layout(
+    tmp_path: Path, header: str, newline: str, final_newline: bool
+) -> None:
+    ledger = tmp_path / "main.beancount"
+    lines = [
+        'option "title" "Spending"',
+        'option "operating_currency" "TWD"',
+        'option "name_expenses" "Costs"',
+        '2020-01-01 custom "fava-extension" "beancount_agent_api"',
+        "2026-01-01 open Assets:Cash TWD",
+        "2026-01-01 open Costs:Food TWD",
+        "",
+        header,
+        "  Costs:Food  100 TWD",
+        "  Assets:Cash",
+    ]
+    data = newline.join(lines).encode() + (newline.encode() if final_newline else b"")
+    ledger.write_bytes(data)
+    app = SpendingApp(create_app([str(ledger)], poll_watcher=True), ledger)
+    [txn] = app.day("2026-10-05")["transactions"]
+    assert app.day("2026-10-05")["ledger_errors"] == 0
+
+    status, body = approve(app, {"items": [{"id": txn["id"]}]})
+    assert (status, body["results"][0]["result"]) == (200, "approved")
+    flag = data.index(b"!")
+    assert ledger.read_bytes() == data[:flag] + b"*" + data[flag + 1 :]
+    assert app.day("2026-10-05")["transactions"][0]["id"] == body["results"][0]["new_id"]
+
+
+class HookedFile:
+    """A file whose write runs a hook first."""
+
+    def __init__(self, file: Any, before_write: Callable[[], None]) -> None:
+        self._file = file
+        self._before_write = before_write
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._file.close()
+
+    def read(self) -> bytes:
+        return self._file.read()
+
+    def seek(self, offset: int) -> int:
+        return self._file.seek(offset)
+
+    def write(self, data: bytes) -> int:
+        self._before_write()
+        return self._file.write(data)
+
+
+def hook_approve_io(
+    monkeypatch: Any,
+    *,
+    before_write: Callable[[], None] | None = None,
+    before_read_back: Callable[[], None] | None = None,
+) -> None:
+    """Run hooks inside approve's write: after its last check, and before it reads back."""
+    real_open = open
+
+    def hooked_open(path: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        if mode == "rb" and before_read_back is not None:
+            before_read_back()
+        file = real_open(path, mode, *args, **kwargs)
+        if mode == "r+b" and before_write is not None:
+            return HookedFile(file, before_write)
+        return file
+
+    monkeypatch.setattr(extension, "open", hooked_open, raising=False)
+
+
+def test_approve_reports_a_failed_write_and_goes_on(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    ids = pending_ids(spending_app, "2026-10-05", "2026-08-10")
+    before = spending_app.txns.read_bytes()
+    failures = [OSError(5, "Input/output error")]
+
+    def fail_once() -> None:
+        if failures:
+            raise failures.pop()
+
+    hook_approve_io(monkeypatch, before_write=fail_once)
+    items = [{"id": ids["採買與晚餐"]}, {"id": ids["代墊午餐"]}]
+    status, body = approve(spending_app, {"items": items})
+
+    first, second = body["results"]
+    offset = before.index('2026-10-05 ! "全聯"'.encode()) + len("2026-10-05 ")
+    assert (status, first["result"], second["result"]) == (200, "error", "approved")
+    assert f"{spending_app.txns} at byte {offset}" in first["message"]
+    assert "Input/output error" in first["message"]
+    assert "new_id" not in first
+    assert spending_app.txns.read_text(encoding="utf-8") == before.decode().replace(
+        '2026-08-10 ! "小明"', '2026-08-10 * "小明"'
+    )
+
+
+def test_approve_reports_a_failed_read_back(spending_app: SpendingApp, monkeypatch: Any) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+
+    def fail() -> None:
+        raise OSError(5, "Input/output error")
+
+    hook_approve_io(monkeypatch, before_read_back=fail)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+    assert (status, body["results"][0]["result"]) == (200, "error")
+    assert "Reading" in body["results"][0]["message"]
+    assert "may or may not be approved" in body["results"][0]["message"]
+
+
+@pytest.mark.parametrize("save", ["in place", "by rename"])
+def test_approve_reports_an_editor_saving_during_the_write(
+    spending_app: SpendingApp, monkeypatch: Any, save: str
+) -> None:
+    id_ = pending_ids(spending_app, "2026-10-05")["採買與晚餐"]
+    original = spending_app.txns.read_bytes()
+    edited = b"; added on top\n" + original
+
+    def editor_saves() -> None:
+        if save == "in place":
+            spending_app.txns.write_bytes(edited)
+        else:
+            replacement = spending_app.txns.with_name("editor.tmp")
+            replacement.write_bytes(edited)
+            replacement.replace(spending_app.txns)
+
+    hook_approve_io(monkeypatch, before_write=editor_saves)
+    status, body = approve(spending_app, {"items": [{"id": id_}]})
+
+    [result] = body["results"]
+    offset = original.index(b"!")
+    assert (status, result["result"]) == (200, "error")
+    assert f"{spending_app.txns} at byte {offset}" in result["message"]
+    assert "not restored" in result["message"]
+    written = spending_app.txns.read_bytes()
+    if save == "in place":
+        # The documented risk: the byte lands at the same offset in the editor's text.
+        assert written == edited[:offset] + b"*" + edited[offset + 1 :]
+    else:
+        # The write went to the replaced file, so the approval is lost.
+        assert written == edited
 
 
 def test_approve_and_add_concurrently(spending_app: SpendingApp) -> None:

@@ -11,7 +11,6 @@ from typing import Any
 from beancount.core import account as account_name
 from beancount.core import amount as beancount_amount
 from beancount.core.data import Close, Open, Posting, Transaction
-from beancount.parser import parser
 from fava.beans import create
 from fava.beans.funcs import hash_entry
 
@@ -472,8 +471,8 @@ class ApproveItem:
 
 
 MAX_APPROVE_ITEMS = 50
-# The flag token after the date on a transaction's first line.
-HEADER_FLAG_RE = re.compile(r"(\S+[ \t]+)!(?=[ \t]|$)")
+# The flag token after the date on a transaction's first line, in the file's bytes.
+HEADER_FLAG_RE = re.compile(rb"[^ \t\r\n]+[ \t]+(!)(?=[ \t\r\n;]|$)")
 
 
 def parse_approve_request(raw: object) -> list[ApproveItem] | Rejection:
@@ -520,33 +519,15 @@ def parse_approve_request(raw: object) -> list[ApproveItem] | Rejection:
     return parsed
 
 
-def approved_slice(source: str, entry: Transaction) -> str | None:
-    """The entry's source lines with only the flag on the first line changed to `*`.
+def flag_offset(data: bytes, lineno: int) -> int | None:
+    """Byte offset of the `!` flag on line `lineno` (1-based) of a file's bytes.
 
-    None when the lines are not this entry: fava finds them by the line number of its last
-    load, and the file may have changed since.
+    None when that line does not start like a pending transaction.
     """
-    first, newline, rest = source.partition("\n")
-    match = HEADER_FLAG_RE.match(first)
-    if match is None or not _is_source_of(source, entry):
-        return None
-    return first[: match.end(1)] + "*" + first[match.end(1) + 1 :] + newline + rest
-
-
-def _is_source_of(source: str, entry: Transaction) -> bool:
-    parsed, errors, _ = parser.parse_string(source)
-    if errors or len(parsed) != 1 or not isinstance(parsed[0], Transaction):
-        return False
-    txn = parsed[0]
-    # pushtag adds tags and the loader fills amounts, neither of which the lines show.
-    return (
-        (txn.date, txn.flag, txn.payee, txn.narration)
-        == (entry.date, entry.flag, entry.payee, entry.narration)
-        and txn.tags <= entry.tags
-        and txn.links <= entry.links
-        and [p.account for p in txn.postings] == [p.account for p in entry.postings]
-        and all(
-            not isinstance(p.units, beancount_amount.Amount) or p.units == q.units
-            for p, q in zip(txn.postings, entry.postings, strict=True)
-        )
-    )
+    start = 0
+    for _ in range(lineno - 1):
+        start = data.find(b"\n", start) + 1
+        if start == 0:
+            return None
+    match = HEADER_FLAG_RE.match(data, start)
+    return None if match is None else match.start(1)

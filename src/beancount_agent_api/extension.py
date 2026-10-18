@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import datetime
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from beancount.core.data import Directive, Transaction
 from fava.beans.funcs import hash_entry
-from fava.core.file import get_entry_slice
+from fava.beans.load import load_uncached
 from fava.ext import FavaExtensionBase, extension_endpoint
-from fava.helpers import FavaAPIError
 from flask import Response, jsonify, request
 
 from beancount_agent_api import mcp
@@ -17,8 +17,8 @@ from beancount_agent_api.core import (
     Accounts,
     ApproveItem,
     Rejection,
-    approved_slice,
     build_transaction,
+    flag_offset,
     parse_add_request,
     parse_approve_request,
     parse_spending_request,
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 TZ = ZoneInfo("Asia/Taipei")
 LOCK_TIMEOUT = 10
+LOAD_ATTEMPTS = 3
 
 # fava's FileModule lock covers only the file write. The link lookup and the insert must share
 # one critical section, or two requests with the same key both miss the link and both write.
@@ -81,10 +82,15 @@ class AgentApi(FavaExtensionBase):
 
     def _approve(self, items: list[ApproveItem]) -> Response:
         ledger = self.ledger
-        ledger.changed()
-        # The ledger reloads once after the last item, so earlier approvals in this request
-        # replace their entries here; a repeated id or key then sees the approved entry.
-        current = {hash_entry(txn): txn for txn in ledger.all_entries_by_type.Transaction}
+        loaded = self._load_files()
+        if loaded is None:
+            busy = Rejection("", "busy", "The ledger files kept changing; retry the request.")
+            return _error(busy, 503)
+        entries, files = loaded
+        # The id hashes the whole entry, metadata and position included, so only the version
+        # the user saw matches. Approvals in this request replace their entries here, so a
+        # repeated id or key then sees the approved entry.
+        current = {hash_entry(e): e for e in entries if isinstance(e, Transaction)}
         results = []
         for item in items:
             result: dict[str, object] = {"id": item.id, "key": item.key}
@@ -105,30 +111,79 @@ class AgentApi(FavaExtensionBase):
             elif entry.flag != "!":
                 result["result"] = "not_pending"
             else:
-                new_id = self._approve_entry(entry)
-                if new_id is None:
-                    result["result"] = "stale"
-                else:
+                outcome, message = self._write_flag(entry, files)
+                if outcome == "approved":
+                    approved = entry._replace(flag="*")
                     del current[item.id]
-                    current[new_id] = entry._replace(flag="*")
-                    result.update(result="approved", new_id=new_id)
+                    current[hash_entry(approved)] = approved
+                    result.update(result="approved", new_id=hash_entry(approved))
+                else:
+                    result["result"] = outcome
+                    if message is not None:
+                        result["message"] = message
             results.append(result)
-        if any(result["result"] == "approved" for result in results):
+        if any(result["result"] in ("approved", "error") for result in results):
             ledger.changed()
         return _json({"results": results, "ledger_errors": len(ledger.errors)}, 200)
 
-    def _approve_entry(self, entry: Transaction) -> str | None:
-        try:
-            source, sha256sum = get_entry_slice(entry)
-            approved = approved_slice(source, entry)
-            if approved is None:
-                return None
-            self.ledger.file.save_entry_slice(hash_entry(entry), approved, sha256sum)
-        # fava reads the lines at the line number of its last load; IndexError means the file
-        # has since become shorter than that.
-        except (FavaAPIError, IndexError):
-            return None
-        return hash_entry(entry._replace(flag="*"))
+    def _load_files(self) -> tuple[list[Directive], dict[str, bytes]] | None:
+        """Load the ledger from its files, with the bytes that load parsed.
+
+        fava's own ledger can lag the files while another request reloads it, so approve
+        loads by itself. Equal bytes before and after the load tie its entries to them.
+        """
+        paths = list(self.ledger.options["include"])
+        for _ in range(LOAD_ATTEMPTS):
+            before = _read_files(paths)
+            entries, _, options = load_uncached(self.ledger.beancount_file_path, is_encrypted=False)
+            paths = list(options["include"])
+            after = _read_files(paths)
+            if before is not None and before == after:
+                return entries, after
+        return None
+
+    def _write_flag(self, entry: Transaction, files: dict[str, bytes]) -> tuple[str, str | None]:
+        """Change the entry's `!` to `*` in place, and nothing else in its file.
+
+        Returns the item's result and, for "error", a message. An editor that saves between
+        the last check and the write is not locked out; reading the file back catches it.
+        """
+        path, lineno = entry.meta["filename"], entry.meta["lineno"]
+        data = files[path]
+        offset = flag_offset(data, lineno)
+        if offset is None:
+            return "stale", None
+        approved = data[:offset] + b"*" + data[offset + 1 :]
+        where = f"{path} at byte {offset}"
+        unknown = "the entry may or may not be approved; reload and check it in fava"
+        # fava writes whole files under this lock; holding it keeps a fava edit from writing
+        # back a copy read before this change.
+        with self.ledger.file._lock:
+            try:
+                with open(path, "r+b") as file:
+                    if file.read() != data:
+                        return "stale", None
+                    file.seek(offset)
+                    file.write(b"*")
+            except FileNotFoundError:
+                return "stale", None
+            except OSError as error:
+                self.ledger.watcher.notify(Path(path))
+                return "error", f"Writing * to {where} failed ({error}); {unknown}."
+            self.ledger.watcher.notify(Path(path))
+            try:
+                with open(path, "rb") as file:
+                    written = file.read()
+            except OSError as error:
+                return "error", f"Reading {where} back failed ({error}); {unknown}."
+        if written != approved:
+            return "error", (
+                f"{where} did not read back as approved: another program wrote the file while "
+                "the flag was written. That byte may now be a stray * in the other program's "
+                "text, and it is not restored; check the file in fava."
+            )
+        files[path] = approved
+        return "approved", None
 
     @extension_endpoint("mcp", ["GET", "POST", "PUT", "DELETE"])
     def mcp_endpoint(self) -> Response:
@@ -186,6 +241,13 @@ class AgentApi(FavaExtensionBase):
 
         options = self.ledger.fava_options
         return to_string(entry, options.currency_column, options.indent)
+
+
+def _read_files(paths: list[str]) -> dict[str, bytes] | None:
+    try:
+        return {path: Path(path).read_bytes() for path in paths}
+    except FileNotFoundError:
+        return None
 
 
 def _error(rejection: Rejection, status: int, **extra: object) -> Response:
