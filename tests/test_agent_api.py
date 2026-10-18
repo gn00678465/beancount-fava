@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import fava.core as fava_core
 import pytest
 from conftest import AGENT_TOKEN, REPO, docker, ledger_volume_of, running_fava
 from fava.application import create_app
@@ -207,6 +209,19 @@ def test_mcp_over_http(fava: Fava) -> None:
     assert (status, body["result"]["isError"]) == (200, False)
     assert body["result"]["structuredContent"]["entry"] == DINNER_ENTRY
     assert fava.txns() == original + "\n" + DINNER_ENTRY
+
+
+def test_agent_reads_spending_only_by_post(fava: Fava) -> None:
+    path = "/extension/AgentApi/spending"
+    status, body = fava.request("POST", path, {"date": "2026-09-20"})
+    assert (status, [txn["narration"] for txn in body["transactions"]]) == (200, ["dinner"])
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{fava.port}/agent{path}",
+        headers={"Authorization": f"Bearer {AGENT_TOKEN}"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(request, timeout=30)
+    assert error.value.code == 403
 
 
 @dataclass(frozen=True)
@@ -578,3 +593,422 @@ def test_mcp_log_names_only_known_methods(in_process: InProcess, capsys: Any) ->
     in_process.mcp({"jsonrpc": "2.0", "method": forged}, {})
     in_process.result(rpc("tools/list"))
     assert capsys.readouterr().err == "mcp - - 404 -32601\nmcp - - 202\nmcp tools/list - 200\n"
+
+
+SPENDING_LEDGER = REPO / "tests" / "fixtures" / "spending-ledger"
+SPENDING = "/spending/extension/AgentApi/spending"
+WEB_123 = {
+    "date": "2026-10-05",
+    "flag": "!",
+    "payee": "全聯",
+    "narration": "採買與晚餐",
+    "key": "web-123",
+    "expenses": [
+        {
+            "account": "Expenses:Daily:Groceries",
+            "name_zh": "日用/雜貨",
+            "number": "300",
+            "currency": "TWD",
+        },
+        {
+            "account": "Expenses:Food:Dinner",
+            "name_zh": "食物/晚餐",
+            "number": "150",
+            "currency": "TWD",
+        },
+    ],
+    "funding": [
+        {
+            "account": "Liabilities:Card:Cathay",
+            "name_zh": "國泰卡",
+            "number": "-450",
+            "currency": "TWD",
+        }
+    ],
+}
+REFUND = {
+    "date": "2026-10-05",
+    "flag": "*",
+    "payee": "全聯",
+    "narration": "退貨",
+    "key": None,
+    "expenses": [
+        {
+            "account": "Expenses:Daily:Groceries",
+            "name_zh": "日用/雜貨",
+            "number": "-50",
+            "currency": "TWD",
+        }
+    ],
+    "funding": [
+        {
+            "account": "Liabilities:Card:Cathay",
+            "name_zh": "國泰卡",
+            "number": "50",
+            "currency": "TWD",
+        }
+    ],
+}
+HOTEL = {
+    "date": "2026-10-05",
+    "flag": "!",
+    "payee": "Hotel",
+    "narration": "訂金",
+    "key": None,
+    "expenses": [
+        {"account": "Expenses:Travel", "name_zh": None, "number": "10.50", "currency": "USD"}
+    ],
+    "funding": [
+        {
+            "account": "Liabilities:Card:Cathay",
+            "name_zh": "國泰卡",
+            "number": "-337.050",
+            "currency": "TWD",
+        }
+    ],
+}
+OCTOBER = {
+    "month": "2026-10",
+    "total": [{"currency": "TWD", "number": "680"}, {"currency": "USD", "number": "30.50"}],
+    "pending": [{"currency": "TWD", "number": "450"}, {"currency": "USD", "number": "10.50"}],
+}
+
+
+@dataclass(frozen=True)
+class SpendingApp:
+    app: Any
+    txns: Path
+
+    def read(self, body: object) -> tuple[int, Any]:
+        response = self.app.test_client().post(
+            SPENDING, data=json.dumps(body), content_type="application/json"
+        )
+        return response.status_code, response.get_json()
+
+    def day(self, date: str) -> Any:
+        status, body = self.read({"date": date})
+        assert status == 200, body
+        return body
+
+    def without_ids(self, date: str) -> Any:
+        body = self.day(date)
+        for txn in body["transactions"]:
+            assert txn.pop("id")
+        return body
+
+
+@pytest.fixture
+def spending_app(tmp_path: Path) -> SpendingApp:
+    shutil.copytree(SPENDING_LEDGER, tmp_path / "ledger")
+    app = create_app([str(tmp_path / "ledger" / "main.beancount")], poll_watcher=True)
+    return SpendingApp(app, tmp_path / "ledger" / "txns.beancount")
+
+
+class Background:
+    """Runs one work on a daemon thread.
+
+    A ThreadPoolExecutor joins its threads on exit and at interpreter shutdown, so a stuck
+    work would hang the run past any result() timeout. A daemon thread holds up neither.
+
+    Every passing path joins its works, so a work that outlives its test means that test has
+    already failed. If the work resumes later, it runs through the class patches of later
+    tests, so failures after the first one in such a run can be consequences of it.
+    """
+
+    def __init__(self, work: Callable[[], Any]) -> None:
+        self._outcome: tuple[bool, Any] | None = None
+        self._thread = threading.Thread(target=self._run, args=(work,), daemon=True)
+        self._thread.start()
+
+    def _run(self, work: Callable[[], Any]) -> None:
+        try:
+            self._outcome = (True, work())
+        except BaseException as error:  # noqa: BLE001  # re-raised in result()
+            self._outcome = (False, error)
+
+    def result(self, deadline: float) -> Any:
+        self._thread.join(max(0.0, deadline - time.monotonic()))
+        if self._thread.is_alive() or self._outcome is None:
+            pytest.fail("a background work did not finish before the deadline")
+        ok, value = self._outcome
+        if not ok:
+            raise value
+        return value
+
+
+def run_together(*works: Callable[[], Any], timeout: float) -> list[Any]:
+    started = [Background(work) for work in works]
+    deadline = time.monotonic() + timeout
+    return [work.result(deadline) for work in started]
+
+
+def test_spending_lists_the_day_and_sums_the_month(spending_app: SpendingApp) -> None:
+    # The cash withdrawal on 2026-10-05 has no expense posting, so it is not listed.
+    assert spending_app.without_ids("2026-10-05") == {
+        "date": "2026-10-05",
+        "transactions": [WEB_123, REFUND, HOTEL],
+        "month": OCTOBER,
+        "ledger_errors": 0,
+    }
+    assert spending_app.without_ids("2026-10-31") == {
+        "date": "2026-10-31",
+        "transactions": [
+            {
+                "date": "2026-10-31",
+                "flag": "*",
+                "payee": None,
+                "narration": "月底晚餐",
+                "key": None,
+                "expenses": [
+                    {
+                        "account": "Expenses:Food:Dinner",
+                        "name_zh": "食物/晚餐",
+                        "number": "200",
+                        "currency": "TWD",
+                    }
+                ],
+                "funding": [
+                    {
+                        "account": "Assets:TW:Cash",
+                        "name_zh": "錢包",
+                        "number": "-200",
+                        "currency": "TWD",
+                    }
+                ],
+            }
+        ],
+        "month": OCTOBER,
+        "ledger_errors": 0,
+    }
+    september = spending_app.without_ids("2026-09-30")
+    assert [txn["narration"] for txn in september["transactions"]] == ["月底宵夜"]
+    assert september["month"] == {
+        "month": "2026-09",
+        "total": [{"currency": "TWD", "number": "100"}],
+        "pending": [],
+    }
+    november = spending_app.without_ids("2026-11-02")
+    assert (november["transactions"], november["month"]["total"]) == (
+        [],
+        [{"currency": "TWD", "number": "999"}],
+    )
+
+
+def test_spending_id_names_the_entry_in_fava(spending_app: SpendingApp) -> None:
+    ids = [txn["id"] for txn in spending_app.day("2026-10-05")["transactions"]]
+    first_lines = []
+    for id_ in ids:
+        response = spending_app.app.test_client().get(
+            "/spending/api/source_slice", query_string={"entry_hash": id_}
+        )
+        first_lines.append(response.get_json()["data"]["slice"].splitlines()[0])
+    assert first_lines == [
+        '2026-10-05 ! "全聯" "採買與晚餐" ^ik-web-123',
+        '2026-10-05 * "全聯" "退貨"',
+        '2026-10-05 ! "Hotel" "訂金"',
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body", "field", "code"),
+    [
+        ({"date": "2026-10-01 OR TRUE"}, "date", "invalid_date"),
+        ({"date": "20261001"}, "date", "invalid_date"),
+        ({"date": "2026-02-30"}, "date", "invalid_date"),
+        ({"date": "9999-12-15"}, "date", "invalid_date"),
+        ({"date": 20261001}, "date", "invalid_date"),
+        ({"date": "2026-10-01", "to": "2026-10-31"}, "to", "unknown_field"),
+        ({}, "date", "missing"),
+        (["2026-10-01"], "", "invalid_body"),
+    ],
+)
+def test_spending_rejections(
+    spending_app: SpendingApp, body: object, field: str, code: str
+) -> None:
+    status, response = spending_app.read(body)
+    assert (status, response["error"]["field"], response["error"]["code"]) == (422, field, code)
+
+
+def test_spending_sees_an_approval_in_fava(spending_app: SpendingApp) -> None:
+    client = spending_app.app.test_client()
+    id_ = spending_app.day("2026-10-05")["transactions"][0]["id"]
+    source = client.get("/spending/api/source_slice", query_string={"entry_hash": id_})
+    data = source.get_json()["data"]
+    approved = client.put(
+        "/spending/api/source_slice",
+        json={
+            "entry_hash": id_,
+            "source": data["slice"].replace(" ! ", " * ", 1),
+            "sha256sum": data["sha256sum"],
+        },
+    )
+    assert approved.status_code == 200
+
+    body = spending_app.without_ids("2026-10-05")
+    assert body["transactions"][0] == {**WEB_123, "flag": "*"}
+    assert body["month"]["pending"] == [{"currency": "USD", "number": "10.50"}]
+
+
+def test_spending_sees_a_write_through_the_api(spending_app: SpendingApp) -> None:
+    response = spending_app.app.test_client().post(
+        "/spending/extension/AgentApi/transactions",
+        data=json.dumps(
+            {"date": "2026-10-05", "source": "錢包", "target": "晚餐", "amount": "70", "key": "k"}
+        ),
+        content_type="application/json",
+    )
+    assert response.status_code == 201
+
+    body = spending_app.without_ids("2026-10-05")
+    assert [txn["key"] for txn in body["transactions"]] == ["web-123", None, None, "k"]
+    assert body["month"]["pending"][0] == {"currency": "TWD", "number": "520"}
+
+
+def test_spending_sees_an_edit_to_the_file(spending_app: SpendingApp) -> None:
+    assert spending_app.day("2026-10-06")["transactions"] == []
+    with spending_app.txns.open("a", encoding="utf-8") as txns:
+        txns.write('\n2026-10-06 * "咖啡"\n  Expenses:Food:Dinner  60 TWD\n  Assets:TW:Cash\n')
+
+    body = spending_app.day("2026-10-06")
+    assert [txn["narration"] for txn in body["transactions"]] == ["咖啡"]
+    assert body["month"]["total"][0] == {"currency": "TWD", "number": "740"}
+
+    with spending_app.txns.open("a", encoding="utf-8") as txns:
+        txns.write("\n2026-10-07 * broken\n")
+    ledger_errors = spending_app.day("2026-10-06")["ledger_errors"]
+    # fava's /api/errors does not reload, so it reads what the request above loaded.
+    errors = spending_app.app.test_client().get("/spending/api/errors").get_json()["data"]
+    assert ledger_errors == len(errors) > 0
+
+
+def test_spending_uses_the_ledger_root_for_expenses(tmp_path: Path) -> None:
+    ledger = tmp_path / "main.beancount"
+    ledger.write_text(
+        'option "title" "Spending"\n'
+        'option "operating_currency" "TWD"\n'
+        'option "name_expenses" "Costs"\n'
+        'option "name_income" "CostsBack"\n'
+        '2020-01-01 custom "fava-extension" "beancount_agent_api"\n'
+        "2026-01-01 open Assets:Cash TWD\n"
+        "2026-01-01 open Costs:Food TWD\n"
+        "2026-01-01 open CostsBack:Refund TWD\n"
+        '2026-10-05 ! "午餐"\n  Costs:Food  100 TWD\n  Assets:Cash\n'
+        '2026-10-05 * "退款"\n  CostsBack:Refund  -30 TWD\n  Assets:Cash\n',
+        encoding="utf-8",
+    )
+    app = SpendingApp(create_app([str(ledger)], poll_watcher=True), ledger)
+    # CostsBack shares the text prefix but is another root, so the refund is not listed.
+    body = app.without_ids("2026-10-05")
+    hundred = [{"currency": "TWD", "number": "100"}]
+    assert body == {
+        "date": "2026-10-05",
+        "transactions": [
+            {
+                "date": "2026-10-05",
+                "flag": "!",
+                "payee": None,
+                "narration": "午餐",
+                "key": None,
+                "expenses": [
+                    {"account": "Costs:Food", "name_zh": None, "number": "100", "currency": "TWD"}
+                ],
+                "funding": [
+                    {"account": "Assets:Cash", "name_zh": None, "number": "-100", "currency": "TWD"}
+                ],
+            }
+        ],
+        "month": {"month": "2026-10", "total": hundred, "pending": hundred},
+        "ledger_errors": 0,
+    }
+
+
+def test_spending_during_another_reload_is_old_until_the_next_read(
+    spending_app: SpendingApp, monkeypatch: Any
+) -> None:
+    assert spending_app.day("2026-10-06")["month"]["total"][0]["number"] == "680"
+    with spending_app.txns.open("a", encoding="utf-8") as txns:
+        txns.write('\n2026-10-06 * "咖啡"\n  Expenses:Food:Dinner  60 TWD\n  Assets:TW:Cash\n')
+
+    # Hold another request inside load_file, after fava's watcher has handed it the change.
+    loading, release = threading.Event(), threading.Event()
+    load = fava_core.load_uncached
+
+    def held_load(*args: Any, **kwargs: Any) -> Any:
+        loading.set()
+        assert release.wait(30)
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(fava_core, "load_uncached", held_load)
+    other = Background(lambda: spending_app.app.test_client().get("/spending/income_statement/"))
+    try:
+        assert loading.wait(30)
+        during = spending_app.day("2026-10-06")
+    finally:
+        release.set()
+    assert other.result(time.monotonic() + 30).status_code == 200
+
+    assert (during["transactions"], during["month"]["total"][0]["number"]) == ([], "680")
+    after = spending_app.day("2026-10-06")
+    assert (
+        [txn["narration"] for txn in after["transactions"]],
+        after["month"]["total"][0]["number"],
+    ) == (["咖啡"], "740")
+
+
+def test_spending_relies_on_fava_to_reload(spending_app: SpendingApp, monkeypatch: Any) -> None:
+    spending_app.day("2026-10-05")
+    calls = []
+    changed = FavaLedger.changed
+
+    def counted(ledger: FavaLedger) -> bool:
+        calls.append(ledger)
+        return changed(ledger)
+
+    monkeypatch.setattr(FavaLedger, "changed", counted)
+    spending_app.day("2026-10-05")
+    # One call is fava's before_request; a second would mean the endpoint reloads by itself.
+    assert len(calls) == 1
+
+
+def test_spending_ignores_filters_of_concurrent_queries(spending_app: SpendingApp) -> None:
+    query = {"query_string": "SELECT date WHERE date = 2026-10-05"}
+    expected = spending_app.day("2026-10-05")
+    client = spending_app.app.test_client()
+    rows = client.get("/spending/api/query", query_string=query).json["data"]["rows"]
+    rounds = 200
+    barrier = threading.Barrier(3, timeout=30)
+
+    def filtered_query() -> tuple[int, int]:
+        client = spending_app.app.test_client()
+        barrier.wait()
+        for _ in range(rounds):
+            client.get("/spending/api/query", query_string={**query, "time": "2019"})
+        return rounds, 0
+
+    def unfiltered_query() -> tuple[int, int]:
+        # The control: fava's own query endpoint reads the other request's filter.
+        client = spending_app.app.test_client()
+        barrier.wait()
+        done = wrong = 0
+        for _ in range(rounds):
+            if client.get("/spending/api/query", query_string=query).json["data"]["rows"] != rows:
+                wrong += 1
+            done += 1
+        return done, wrong
+
+    def read_spending() -> tuple[int, int]:
+        barrier.wait()
+        done = wrong = 0
+        for _ in range(rounds):
+            if spending_app.read({"date": "2026-10-05"}) != (200, expected):
+                wrong += 1
+            done += 1
+        return done, wrong
+
+    (_, _), (query_done, query_wrong), (spending_done, spending_wrong) = run_together(
+        filtered_query, unfiltered_query, read_spending, timeout=120
+    )
+
+    assert (query_done, spending_done) == (rounds, rounds)
+    assert spending_wrong == 0
+    assert query_wrong > 0

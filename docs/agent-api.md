@@ -16,7 +16,7 @@ flowchart LR
     Agent["Agent<br>Claude Code"] -->|"區網 http://192.168.2.11:5656<br>Authorization: Bearer"| Guard
     subgraph Container["fava container（port 5000）"]
         Guard["guard<br>檢查憑證與路徑"] --> Fava["fava 網頁與 /api/"]
-        Guard --> Ext["AgentApi extension<br>transactions、mcp"]
+        Guard --> Ext["AgentApi extension<br>transactions、spending、mcp"]
         Ext --> Fava
     end
     Fava --> Ledger[("ledger 檔<br>/ledger")]
@@ -25,7 +25,7 @@ flowchart LR
 | 身分 | 憑證 | 可以做的事 |
 |---|---|---|
 | 瀏覽器 | Cloudflare Access 的 JWT | fava 的全部功能，包含核准、修改、刪除交易 |
-| Agent | Bearer token | 讀 fava `/api/` 的 GET 端點。經由 `AgentApi` 新增 `!` 交易 |
+| Agent | Bearer token | 讀 fava `/api/` 的 GET 端點。經由 `AgentApi` 讀花費、新增 `!` 交易 |
 | 其他 | 沒有或無效 | 一律 401 |
 
 Agent 不能修改、刪除或核准交易。這些請求回 403。

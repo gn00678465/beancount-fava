@@ -192,6 +192,76 @@ fava 寫入前不檢查整本帳。201 的 `errors` 是寫入前後 fava 的錯�
 | `same_account` | `target` | `source` 與 `target` 是同一個帳戶。 |
 | `currency_not_allowed` | `currency` | 帳戶不接受這個幣別。 |
 
+## `POST /<bfile>/extension/AgentApi/spending`
+
+讀一天的交易與那天所在月份的費用合計，包含待核准（`!`）與已核准（`*`）的交易。這個端點只讀不寫。body 是 JSON 物件，`Content-Type` 是 `application/json`。
+
+| 欄位 | 必填 | 型別 | 規則 |
+|---|---|---|---|
+| `date` | 是 | string | `YYYY-MM-DD`。不接受其他欄位。 |
+
+請求 `{"date": "2026-10-05"}` 的回應如下，`transactions` 只列出第一筆：
+
+```json
+{
+  "date": "2026-10-05",
+  "transactions": [
+    {
+      "id": "0f9bf9862a2867de7a7034abe8b01cd3",
+      "date": "2026-10-05", "flag": "!",
+      "payee": "全聯", "narration": "採買與晚餐",
+      "key": "web-123",
+      "expenses": [
+        {"account": "Expenses:Daily:Groceries", "name_zh": "日用/雜貨", "number": "300", "currency": "TWD"},
+        {"account": "Expenses:Food:Dinner", "name_zh": "食物/晚餐", "number": "150", "currency": "TWD"}
+      ],
+      "funding": [
+        {"account": "Liabilities:Card:Cathay", "name_zh": "國泰卡", "number": "-450", "currency": "TWD"}
+      ]
+    }
+  ],
+  "month": {
+    "month": "2026-10",
+    "total":   [{"currency": "TWD", "number": "680"}, {"currency": "USD", "number": "30.50"}],
+    "pending": [{"currency": "TWD", "number": "450"}, {"currency": "USD", "number": "10.50"}]
+  },
+  "ledger_errors": 0
+}
+```
+
+| 欄位 | 說明 |
+|---|---|
+| `transactions` | 那天有費用 posting 的交易，依帳本順序。只在資產與負債之間轉帳的交易不列出。費用帳戶是根名稱等於 `option "name_expenses"`（預設 `Expenses`）的帳戶。 |
+| `id` | fava 的 entry hash，可以傳給 `GET /<bfile>/api/source_slice?entry_hash=<id>`。只代表這個版本：交易的任何文字改變（包含核准時 flag 從 `!` 改成 `*`），或交易所在的檔名或行號改變（例如同一檔案中它前面多了一行）後，`id` 也會改變。跨次對應同一筆交易用 `key`。 |
+| `payee` | 沒有 payee 時是 `null`。 |
+| `key` | link `^ik-<key>` 去掉 `ik-` 的部分。沒有這種 link 時是 `null`。交易有多個 `^ik-` link 時（例如在 fava 手動加上），取去掉 `ik-` 後依字母排序最前的一個，其他的不回傳。所以 `key` 不一定是當初新增這筆交易時送出的 key，也不代表交易全部的 link。`POST transactions` 只寫入一個 `^ik-` link。 |
+| `expenses` | 費用 posting，依帳本順序。 |
+| `funding` | 其餘 posting，依帳本順序。 |
+| `name_zh` | 帳戶 `open` 的 `name-zh` metadata。沒有時是 `null`。 |
+| `number` | Decimal 字串，不用指數表示，例如 `"-337.050"`。以 posting 的單位幣別計，有 `@` 價格也不換算。 |
+| `month.total` | 當月每種幣別的費用淨額，包含所有 flag。退款以負數抵減。依幣別字母排序。 |
+| `month.pending` | 同 `total`，但只算 `!` 的交易。 |
+| `ledger_errors` | fava 的帳本錯誤數量。帳本有語法錯誤時，出錯的交易不會出現在回應中，所以 `ledger_errors` 大於 0 時合計可能不完整。 |
+
+fava 在處理 extension 的請求之前會檢查 ledger 檔有沒有改變，改了就重新載入。所以從 fava 網頁核准、經由 `POST transactions` 寫入、或直接改檔之後，不必先呼叫 `/api/changed`。
+
+這個端點會檢查變更，但不等其他請求的重載完成。另一個請求正在重新載入時，這次讀取回 200 與重新載入前的資料；重新載入完成後，下一次讀取會是新資料。fava 先記下「這次變更已有人處理」，再載入檔案，兩步之間沒有鎖，所以同時進來的請求不會再載入一次。daemon 與網頁要靠下一次讀取更新，例如寫入或核准後重新讀取，或定期重新讀取。
+
+這個端點不經過 fava 的 BQL shell，所以不受其他請求的篩選條件影響。
+
+| 狀態 | 意思 |
+|---|---|
+| 200 | 回傳上面的 body。 |
+| 422 | 請求不符合規則。`error` 的格式同 `POST transactions`，`code` 見下表。 |
+| 403 | agent 用 `POST` 以外的 method。 |
+
+| 422 的 `code` | `field` | 原因 |
+|---|---|---|
+| `invalid_body` | 空字串 | body 不是 JSON 物件。 |
+| `unknown_field` | 該欄位 | 有 `date` 以外的欄位。 |
+| `missing` | `date` | 缺少 `date`。 |
+| `invalid_date` | `date` | 不是 `YYYY-MM-DD` 格式的有效日期，或那個月的下一個月超出日期範圍（`9999-12`）。 |
+
 ## MCP 端點 `/<bfile>/extension/AgentApi/mcp`
 
 ### 協定

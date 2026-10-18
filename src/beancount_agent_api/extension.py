@@ -15,6 +15,8 @@ from beancount_agent_api.core import (
     Rejection,
     build_transaction,
     parse_add_request,
+    parse_spending_request,
+    spending,
 )
 
 if TYPE_CHECKING:
@@ -39,6 +41,24 @@ class AgentApi(FavaExtensionBase):
     @extension_endpoint("transactions", ["POST"])
     def transactions(self) -> Response:
         return self.add(request.get_json(silent=True))
+
+    @extension_endpoint("spending", ["POST"])
+    def spending_endpoint(self) -> Response:
+        # fava reloads the ledger before every request outside its json_api blueprint, so this
+        # read sees writes from fava, this API, and editors without calling ledger.changed().
+        date = parse_spending_request(request.get_json(silent=True))
+        if isinstance(date, Rejection):
+            return _error(date, 422)
+        ledger = self.ledger
+        # Not fava's query shell: it keeps one connection per ledger, and a filtered query in
+        # another request swaps the entries under this one.
+        body = spending(
+            ledger.all_entries_by_type.Transaction,
+            ledger.all_entries_by_type.Open,
+            ledger.options["name_expenses"],
+            date,
+        )
+        return _json({**body, "ledger_errors": len(ledger.errors)}, 200)
 
     @extension_endpoint("mcp", ["GET", "POST", "PUT", "DELETE"])
     def mcp_endpoint(self) -> Response:

@@ -1,0 +1,36 @@
+2026-09-30 * "月底宵夜"
+  Expenses:Food:Dinner                                  100 TWD
+  Assets:TW:Cash
+
+2026-10-01 * "早餐"
+  Expenses:Food:Dinner                                   80 TWD
+  Assets:TW:Cash
+
+2026-10-05 ! "全聯" "採買與晚餐" ^ik-web-123
+  Expenses:Daily:Groceries                              300 TWD
+  Expenses:Food:Dinner                                  150 TWD
+  Liabilities:Card:Cathay                              -450 TWD
+
+2026-10-05 * "提款"
+  Assets:TW:Cash                                       1000 TWD
+  Assets:TW:Bank                                      -1000 TWD
+
+2026-10-05 * "全聯" "退貨"
+  Expenses:Daily:Groceries                              -50 TWD
+  Liabilities:Card:Cathay                                50 TWD
+
+2026-10-05 ! "Hotel" "訂金"
+  Expenses:Travel                                     10.50 USD @ 32.1 TWD
+  Liabilities:Card:Cathay
+
+2026-10-20 * "Diner" "出差晚餐"
+  Expenses:Food:Dinner                                   20 USD
+  Assets:US:Bank
+
+2026-10-31 * "月底晚餐"
+  Expenses:Food:Dinner                                  200 TWD
+  Assets:TW:Cash
+
+2026-11-01 * "下個月"
+  Expenses:Food:Dinner                                  999 TWD
+  Assets:TW:Cash

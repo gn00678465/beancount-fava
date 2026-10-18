@@ -6,11 +6,13 @@ import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 from beancount.core import account as account_name
 from beancount.core import amount as beancount_amount
-from beancount.core.data import Close, Open, Transaction
+from beancount.core.data import Close, Open, Posting, Transaction
 from fava.beans import create
+from fava.beans.funcs import hash_entry
 
 
 @dataclass(frozen=True)
@@ -362,3 +364,101 @@ def build_transaction(req: AddRequest) -> Transaction:
             create.posting(req.source, create.amount(-req.amount, req.currency)),
         ],
     )
+
+
+def parse_spending_request(raw: object) -> datetime.date | Rejection:
+    if not isinstance(raw, dict):
+        return Rejection(
+            "",
+            "invalid_body",
+            "Send a JSON object as the body, with Content-Type: application/json.",
+        )
+    for field in raw:
+        if field != "date":
+            return Rejection(field, "unknown_field", f"Remove {field!r}; 'date' is the only field.")
+    if "date" not in raw:
+        return Rejection("date", "missing", "Send 'date'.")
+    text = raw["date"]
+    try:
+        if not isinstance(text, str) or DATE_RE.fullmatch(text) is None:
+            raise ValueError
+        date = datetime.date.fromisoformat(text)
+        _next_month(date)
+    # The month total ends at the first day of the next month, which overflows in 9999-12.
+    except (ValueError, OverflowError):
+        return Rejection("date", "invalid_date", "Send 'date' as YYYY-MM-DD.")
+    return date
+
+
+def _next_month(date: datetime.date) -> datetime.date:
+    return (date.replace(day=1) + datetime.timedelta(days=31)).replace(day=1)
+
+
+def spending(
+    transactions: Iterable[Transaction],
+    opens: Iterable[Open],
+    expenses_root: str,
+    date: datetime.date,
+) -> dict[str, Any]:
+    names: dict[str, str | None] = {}
+    for open_ in opens:
+        name_zh = open_.meta.get("name-zh")
+        names.setdefault(open_.account, name_zh if isinstance(name_zh, str) else None)
+
+    def is_expense(account: str) -> bool:
+        return account.split(":", 1)[0] == expenses_root
+
+    def posting(p: Posting) -> dict[str, Any]:
+        return {
+            "account": p.account,
+            "name_zh": names.get(p.account),
+            "number": _decimal(p.units.number),
+            "currency": p.units.currency,
+        }
+
+    first, end = date.replace(day=1), _next_month(date)
+    day: list[dict[str, Any]] = []
+    total: dict[str, Decimal] = {}
+    pending: dict[str, Decimal] = {}
+    for txn in transactions:
+        if not first <= txn.date < end:
+            continue
+        expenses = [p for p in txn.postings if is_expense(p.account)]
+        if not expenses:
+            continue
+        for sums in (total, pending) if txn.flag == "!" else (total,):
+            for p in expenses:
+                sums[p.units.currency] = sums.get(p.units.currency, Decimal(0)) + p.units.number
+        if txn.date != date:
+            continue
+        keys = sorted(link.removeprefix("ik-") for link in txn.links if link.startswith("ik-"))
+        day.append(
+            {
+                "id": hash_entry(txn),
+                "date": txn.date.isoformat(),
+                "flag": txn.flag,
+                "payee": txn.payee or None,
+                "narration": txn.narration,
+                "key": keys[0] if keys else None,
+                "expenses": [posting(p) for p in expenses],
+                "funding": [posting(p) for p in txn.postings if not is_expense(p.account)],
+            }
+        )
+    return {
+        "date": date.isoformat(),
+        "transactions": day,
+        "month": {
+            "month": f"{date.year:04}-{date.month:02}",
+            "total": _sums(total),
+            "pending": _sums(pending),
+        },
+    }
+
+
+def _sums(sums: Mapping[str, Decimal]) -> list[dict[str, str]]:
+    return [{"currency": c, "number": _decimal(sums[c])} for c in sorted(sums)]
+
+
+def _decimal(number: Decimal) -> str:
+    # A JSON number loses Decimal precision in JavaScript, and str() can print an exponent.
+    return format(number, "f")
