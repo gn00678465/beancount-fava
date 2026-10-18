@@ -1583,7 +1583,7 @@ def test_approve_processes_nothing_when_a_file_cannot_be_read(
         status, body = approve(spending_app, {"items": [{"id": id_}]})
     finally:
         spending_app.txns.chmod(0o644)
-    assert (status, body["error"]["code"]) == (503, "busy")
+    assert (status, body["error"]["code"]) == (503, "ledger_unreadable")
     assert str(spending_app.txns) in body["error"]["message"]
     assert "no item was processed" in body["error"]["message"]
     assert spending_app.txns.read_bytes() == before

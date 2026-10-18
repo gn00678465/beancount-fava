@@ -90,7 +90,9 @@ class AgentApi(FavaExtensionBase):
             loaded = self._load_files()
         except OSError as error:
             unreadable = Rejection(
-                "", "busy", f"A ledger file could not be read ({error}); no item was processed."
+                "",
+                "ledger_unreadable",
+                f"A ledger file could not be read ({error}); no item was processed.",
             )
             return _error(unreadable, 503)
         if loaded is None:
