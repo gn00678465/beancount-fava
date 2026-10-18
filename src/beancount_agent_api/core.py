@@ -28,6 +28,8 @@ class Accounts:
     by_name: Mapping[str, Account]
     lookup: Mapping[str, tuple[str, ...]]
     default_currency: str | None
+    # The root of expense accounts, from option "name_expenses".
+    expenses_root: str
 
     @classmethod
     def from_directives(
@@ -35,6 +37,7 @@ class Accounts:
         opens: Iterable[Open],
         closes: Iterable[Close],
         operating_currencies: Sequence[str],
+        expenses_root: str,
     ) -> Accounts:
         close_dates = {close.account: close.date for close in closes}
         by_name: dict[str, Account] = {}
@@ -59,6 +62,7 @@ class Accounts:
             by_name=by_name,
             lookup={key: tuple(sorted(names)) for key, names in keys.items()},
             default_currency=operating_currencies[0] if operating_currencies else None,
+            expenses_root=expenses_root,
         )
 
 
@@ -309,6 +313,14 @@ def parse_add_request(
         account = _resolve(account_field, account_text, date, accounts)
         if isinstance(account, Rejection):
             return account
+        # The split form records the expenses of one receipt; spending lists only these.
+        if "targets" in raw and account.name.split(":", 1)[0] != accounts.expenses_root:
+            return Rejection(
+                account_field,
+                "not_expense_account",
+                f"{account.name} is not under {accounts.expenses_root}; each item in 'targets' "
+                "must be an expense account.",
+            )
         if account.name == source.name:
             return Rejection(
                 account_field,

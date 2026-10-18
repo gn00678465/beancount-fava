@@ -76,7 +76,7 @@ fava 的 PUT 與 DELETE 端點對 agent 回 403：`PUT` 的 `add_document`、`ad
 | `source` | 是 | string | 錢流出的帳戶。可以是帳戶全名、完整的 `name-zh`，或 `name-zh` 以 `/` 分段的最後一段。 |
 | `target` | `target` 加 `amount`，與 `targets` 擇一 | string | 錢流入的帳戶。格式同 `source`。 |
 | `amount` | `target` 加 `amount`，與 `targets` 擇一 | string | `[0-9]{1,15}(\.[0-9]{1,2})?`，大於 0。 |
-| `targets` | `target` 加 `amount`，與 `targets` 擇一 | 物件陣列 | 1 到 20 筆，每筆是 `{"account", "amount"}`，兩個欄位都必填，不接受其他欄位。`account` 的格式同 `source`，`amount` 的規則同 `amount`。同一個帳戶只能出現一次。 |
+| `targets` | `target` 加 `amount`，與 `targets` 擇一 | 物件陣列 | 1 到 20 筆，每筆是 `{"account", "amount"}`，兩個欄位都必填，不接受其他欄位。`account` 的格式同 `source`，必須是費用帳戶（根名稱等於 `option "name_expenses"`，預設 `Expenses`），`amount` 的規則同 `amount`。同一個帳戶只能出現一次。 |
 | `key` | 是 | string | `[A-Za-z0-9\-_/.]+`。寫成 link `^ik-<key>`。 |
 | `date` | `date` 與 `time` 擇一 | string | `YYYY-MM-DD`。 |
 | `time` | `date` 與 `time` 擇一 | string | RFC 3339，要有時區，例如 `2026-09-25T07:00:00+08:00`。fava 換算成 `Asia/Taipei` 的日期，並加上 metadata `time: "07:00:00"`。 |
@@ -94,6 +94,7 @@ fava 的 PUT 與 DELETE 端點對 agent 回 403：`PUT` 的 `add_document`、`ad
 - 帳戶在該日期必須是開啟的。開帳日不能晚於該日期。帳戶有關帳日時，關帳日不能早於該日期。
 - `source` 與 `target`（或 `targets` 中的任何帳戶）不能是同一個帳戶。
 - `targets` 中的帳戶以別名解析後不能重複，例如「晚餐」與 `Expenses:Food:Dinner` 算同一個。
+- `targets` 只接受費用帳戶，所以拆分的每一筆都會出現在 `POST spending`。要記到其他帳戶（例如轉帳到資產帳戶）時，用單一的 `target`，它不限帳戶種類。
 
 ### 寫入的交易
 
@@ -219,6 +220,7 @@ fava 寫入前不檢查整本帳。201 的 `errors` 是寫入前後 fava 的錯�
 | `account_closed` | `source`、`target` 或 `targets[<n>].account` | 日期晚於關帳日。 |
 | `same_account` | `target` 或 `targets[<n>].account` | 與 `source` 是同一個帳戶。 |
 | `duplicate_account` | `targets[<n>].account` | 這個帳戶已在前面的 `targets` 出現過。 |
+| `not_expense_account` | `targets[<n>].account` | 帳戶的根名稱不是 `option "name_expenses"`。 |
 | `currency_not_allowed` | `currency` | 帳戶不接受這個幣別。 |
 
 ## `POST /<bfile>/extension/AgentApi/spending`

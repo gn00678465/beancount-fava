@@ -280,6 +280,7 @@ class AgentApi(FavaExtensionBase):
             ledger.all_entries_by_type.Open,
             ledger.all_entries_by_type.Close,
             ledger.options["operating_currency"],
+            ledger.options["name_expenses"],
         )
         today = datetime.datetime.now(TZ).date()
         req = parse_add_request(raw, accounts, TZ, today)

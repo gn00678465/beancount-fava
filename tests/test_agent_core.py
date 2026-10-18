@@ -40,6 +40,7 @@ def accounts() -> Accounts:
         [entry for entry in entries if isinstance(entry, Open)],
         [entry for entry in entries if isinstance(entry, Close)],
         options["operating_currency"],
+        options["name_expenses"],
     )
 
 
@@ -141,6 +142,7 @@ def test_invalid_account_name_opened_in_the_ledger() -> None:
         ],
         [],
         ["TWD"],
+        "Expenses",
     )
     assert parse(accounts, source="零錢", target="Expenses:Food") == Rejection(
         "source", "invalid_account_name", "Assets:Cash:錢包 is not a valid account name."
@@ -311,7 +313,18 @@ def target(account: str, amount: object = "10") -> dict[str, object]:
             {"targets": [target("晚餐"), target("Expenses:Food:Snack")]},
             ("targets[1].account", "unknown_account"),
         ),
-        ({"targets": [target("晚餐"), target("錢包")]}, ("targets[1].account", "same_account")),
+        (
+            {"targets": [target("晚餐"), target("錢包")]},
+            ("targets[1].account", "not_expense_account"),
+        ),
+        (
+            {"targets": [target("晚餐"), target("Equity:Opening-Balances")]},
+            ("targets[1].account", "not_expense_account"),
+        ),
+        (
+            {"source": "晚餐", "targets": [target("公務/午餐"), target("Expenses:Food:Dinner")]},
+            ("targets[1].account", "same_account"),
+        ),
         (
             {"targets": [target("晚餐"), target("Expenses:Food:Dinner")]},
             ("targets[1].account", "duplicate_account"),
@@ -323,6 +336,12 @@ def test_split_rejections(
     accounts: Accounts, changes: dict[str, object], expected: tuple[str, str]
 ) -> None:
     assert code(parse_split(accounts, **changes)) == expected
+
+
+def test_single_target_may_be_any_account(accounts: Accounts) -> None:
+    result = parse(accounts, target="Equity:Opening-Balances")
+    assert isinstance(result, AddRequest), result
+    assert result.targets == (Target("Equity:Opening-Balances", Decimal(190)),)
 
 
 def test_twenty_targets_are_accepted(accounts: Accounts) -> None:

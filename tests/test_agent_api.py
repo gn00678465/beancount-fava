@@ -610,6 +610,67 @@ def test_spending_reads_back_every_target_of_a_split(spending_app: SpendingApp) 
     )
 
 
+def test_split_targets_follow_the_ledger_expenses_root(tmp_path: Path) -> None:
+    ledger = tmp_path / "main.beancount"
+    ledger.write_text(
+        'option "title" "Costs"\n'
+        'option "operating_currency" "TWD"\n'
+        'option "name_expenses" "Costs"\n'
+        'option "name_income" "CostsBack"\n'
+        '2020-01-01 custom "fava-extension" "beancount_agent_api"\n'
+        "2026-01-01 open Assets:Cash TWD\n"
+        "2026-01-01 open Costs:Food TWD\n"
+        "2026-01-01 open Costs:Gift TWD\n"
+        "2026-01-01 open CostsBack:Refund TWD\n",
+        encoding="utf-8",
+    )
+    app = create_app([str(ledger)], poll_watcher=True)
+
+    def add(body: dict[str, Any]) -> tuple[int, Any]:
+        response = app.test_client().post(
+            "/costs/extension/AgentApi/transactions",
+            data=json.dumps(body),
+            content_type="application/json",
+        )
+        return response.status_code, response.get_json()
+
+    split = {"date": "2026-10-05", "source": "Assets:Cash", "key": "c1"}
+    # CostsBack shares the text prefix but is another root.
+    status, body = add(
+        {**split, "targets": [_target("Costs:Food", "100"), _target("CostsBack:Refund", "20")]}
+    )
+    assert (status, body["error"]["field"], body["error"]["code"]) == (
+        422,
+        "targets[1].account",
+        "not_expense_account",
+    )
+    assert "Costs" in body["error"]["message"]
+    single = {**split, "target": "CostsBack:Refund", "amount": "20", "dry_run": True}
+    assert add(single)[0] == 200
+
+    assert (
+        add({**split, "targets": [_target("Costs:Food", "100"), _target("Costs:Gift", "20")]})[0]
+        == 201
+    )
+    spent = (
+        app.test_client()
+        .post(
+            "/costs/extension/AgentApi/spending",
+            data=json.dumps({"date": "2026-10-05"}),
+            content_type="application/json",
+        )
+        .get_json()
+    )
+    assert [e["account"] for e in spent["transactions"][0]["expenses"]] == [
+        "Costs:Food",
+        "Costs:Gift",
+    ]
+
+
+def _target(account: str, amount: str) -> dict[str, str]:
+    return {"account": account, "amount": amount}
+
+
 def test_mcp_names_the_supported_version_for_legacy_clients(in_process: InProcess) -> None:
     response = in_process.mcp(rpc("initialize"))
     assert (response.status_code, response.get_json()) == (
