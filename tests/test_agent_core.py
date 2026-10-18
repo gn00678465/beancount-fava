@@ -9,6 +9,7 @@ import fava.core  # noqa: F401  # fava.beans.str raises a circular ImportError u
 import pytest
 from beancount import loader
 from beancount.core.data import Close, Open
+from fava.beans import create
 from fava.beans.str import to_string
 
 from beancount_agent_api.core import (
@@ -17,6 +18,8 @@ from beancount_agent_api.core import (
     Rejection,
     build_transaction,
     parse_add_request,
+    parse_spending_request,
+    spending,
 )
 
 LEDGER = Path(__file__).resolve().parent / "fixtures" / "agent-ledger" / "main.beancount"
@@ -401,3 +404,46 @@ def test_render_payee_tags_meta_in_one_order(accounts: Accounts) -> None:
     )
     assert to_string(build_transaction(first), 61, 2) == expected
     assert to_string(build_transaction(second), 61, 2) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"date": "2026-10-05"}, datetime.date(2026, 10, 5)),
+        ({"date": "9999-11-30"}, datetime.date(9999, 11, 30)),
+        ({"date": "2026-10-05\n"}, ("date", "invalid_date")),
+        ({"date": "２０２６-10-05"}, ("date", "invalid_date")),
+        ({"date": None}, ("date", "invalid_date")),
+        ({"date": "9999-12-01"}, ("date", "invalid_date")),
+        ({"from": "2026-10-01"}, ("from", "unknown_field")),
+        ("2026-10-05", ("", "invalid_body")),
+        (None, ("", "invalid_body")),
+    ],
+)
+def test_parse_spending_request(raw: object, expected: object) -> None:
+    result = parse_spending_request(raw)
+    assert (result if isinstance(result, datetime.date) else code(result)) == expected
+
+
+def test_spending_numbers_never_use_an_exponent() -> None:
+    txn = create.transaction(
+        meta={},
+        date=datetime.date(2026, 10, 5),
+        flag="*",
+        payee=None,
+        narration="",
+        tags=frozenset(),
+        links=frozenset({"note", "ik-a"}),
+        postings=[
+            create.posting("Expenses:Rent", create.amount(Decimal("1E+3"), "TWD")),
+            create.posting("Assets:Bank", create.amount(Decimal("-1E+3"), "TWD")),
+        ],
+    )
+    body = spending([txn], [], "Expenses", datetime.date(2026, 10, 5))
+    [listed] = body["transactions"]
+    assert (listed["key"], listed["expenses"][0]["number"], listed["funding"][0]["number"]) == (
+        "a",
+        "1000",
+        "-1000",
+    )
+    assert body["month"]["total"] == [{"currency": "TWD", "number": "1000"}]
