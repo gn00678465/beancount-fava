@@ -1,8 +1,12 @@
-"""beangulp importer for a 交易明細 xlsx exported by online banking.
+"""beangulp importer for one layout of 交易明細 xlsx exported by online banking.
 
 The export is one sheet: a title row, a header row, one row per transaction in
 ascending order, and a footer row with the row count and the export time. The
 title names the bank, so the ledger's import config passes it in.
+
+parse() and identify() read this layout; the rows, balances and dedup work on
+Statement and Row, apart from the sheet line numbers kept as entry metadata. A statement without a running balance, such as a card bill,
+does not fit Row.
 """
 
 from __future__ import annotations
