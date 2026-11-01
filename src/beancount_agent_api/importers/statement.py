@@ -25,6 +25,7 @@ COLUMNS = "ABCDEF"
 # The bank gives no transaction number. The time, amount and running balance
 # together identify one row, so a re-imported row matches the one already saved.
 ID_KEY = "statement-id"
+BOOKED_KEY = "booking-date"
 SHEET = "xl/worksheets/sheet1.xml"
 # A stock trade is often entered by hand on the trade day while the bank debits
 # it days later; the daily balance assertions catch a pair this window misses.
@@ -37,6 +38,7 @@ _FOOTER = re.compile(r"共(\d+)筆資料\s*資料日期：(\d{4}/\d{2}/\d{2})(?:
 class Row:
     time: str
     date: datetime.date
+    booked: datetime.date
     summary: str
     amount: Decimal
     balance: Decimal
@@ -95,9 +97,12 @@ def parse(path: str, title: str) -> Statement:
         raise ValueError(f"row {len(rows)}: expected the 共N筆資料 footer, got {rows[-1][0]!r}")
     parsed = []
     for line, (time, date, summary, amount, balance, note) in enumerate(rows[2:-1], start=3):
+        # The running balance follows the 交易日 order, so the transaction is
+        # dated by it; 帳務日 can fall on a later business day.
         row = Row(
             time=time,
-            date=_date(date),
+            date=_date(time.split(" ")[0]),
+            booked=_date(date),
             summary=summary,
             amount=_decimal(amount, f"D{line}"),
             balance=_decimal(balance, f"E{line}"),
@@ -145,7 +150,9 @@ class StatementImporter(beangulp.Importer):
     def identify(self, filepath: str) -> bool:
         try:
             rows = _read_rows(filepath)
-        except (OSError, KeyError, ValueError, zipfile.BadZipFile, ET.ParseError):
+        except Exception:  # noqa: BLE001
+            # fava lists every uploaded file through identify and one exception
+            # fails the whole import page, so a file this cannot read is not ours.
             return False
         return _is_export(rows, self._title)
 
@@ -157,6 +164,8 @@ class StatementImporter(beangulp.Importer):
         other = next((account for needle, account in self._rules if needle in text), None)
         units = Amount(row.amount, self._currency)
         meta = data.new_metadata(filepath, line, {ID_KEY: f"{row.time} {row.amount} {row.balance}"})
+        if row.booked != row.date:
+            meta[BOOKED_KEY] = row.booked
         postings = [
             data.Posting(self._account, units, None, None, None, None),
             data.Posting(other or self._fallback, -units, None, None, None, None),
@@ -217,7 +226,9 @@ class StatementImporter(beangulp.Importer):
         balances = {(e.date, e.account, e.amount) for e in existing if isinstance(e, data.Balance)}
         by_amount: dict[Decimal, list[data.Transaction]] = {}
         for e in existing:
-            if isinstance(e, data.Transaction) and ID_KEY not in (e.meta or {}):
+            # A pad's filler transaction is not a saved row of any statement.
+            saved = isinstance(e, data.Transaction) and e.flag != flags.FLAG_PADDING
+            if saved and ID_KEY not in (e.meta or {}):
                 cash = self._cash(e)
                 if cash is not None:
                     by_amount.setdefault(cash, []).append(e)

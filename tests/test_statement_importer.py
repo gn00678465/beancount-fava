@@ -16,7 +16,8 @@ from beancount.parser import printer
 from beangulp.extract import DUPLICATE
 from fava.core.ingest import extract_from_file, load_import_config
 
-from beancount_agent_api.importers.statement import ID_KEY, StatementImporter, parse
+from beancount_agent_api.importers import statement as statement_module
+from beancount_agent_api.importers.statement import BOOKED_KEY, ID_KEY, StatementImporter, parse
 
 ACCOUNT = "Assets:Bank:Checking"
 TITLE = "測試銀行 - 交易明細"
@@ -298,3 +299,57 @@ def test_fava_loads_an_import_config_that_uses_it(statement: Path, tmp_path: Pat
     assert wrapped.identify(statement)
     entries = extract_from_file(wrapped, statement, [])
     assert len(entries) == len(ROWS) + 3
+
+
+def test_rows_are_dated_by_the_transaction_day(importer: StatementImporter, tmp_path: Path) -> None:
+    # Two statements split at a row booked on a later business day: the
+    # assertions follow the running balance, so both save without an error.
+    first = [
+        ["2026/06/12 10:00:00", "2026/06/12", "CD轉出", -1000, 9000, ""],
+        ["2026/06/12 20:00:00", "2026/06/15", "CD轉出", -500, 8500, ""],
+    ]
+    second = [
+        ["2026/06/13 09:00:00", "2026/06/15", "CD轉出", -200, 8300, ""],
+        ["2026/06/15 09:00:00", "2026/06/15", "CD轉出", -100, 8200, ""],
+    ]
+    a = importer.extract(
+        str(write_statement(tmp_path / "a.xlsx", first, exported="2026/06/14")), []
+    )
+    b = importer.extract(
+        str(write_statement(tmp_path / "b.xlsx", second, exported="2026/06/20")), []
+    )
+    importer.deduplicate(b, a)
+    late = a[1]
+    assert (late.date, late.meta[BOOKED_KEY]) == (
+        datetime.date(2026, 6, 12),
+        datetime.date(2026, 6, 15),
+    )
+    assert BOOKED_KEY not in a[0].meta
+    assert load_with(a + [e for e in b if not e.meta.get(DUPLICATE)], tmp_path) == []
+
+
+def test_identify_says_no_to_a_file_it_cannot_read(
+    importer: StatementImporter, statement: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unreadable(path: str) -> list[list[str]]:
+        raise RuntimeError("File is encrypted, password required for extraction")
+
+    monkeypatch.setattr(statement_module, "_read_rows", unreadable)
+    assert not importer.identify(str(statement))
+
+
+def test_a_pad_is_not_taken_for_a_saved_row(
+    importer: StatementImporter, statement: Path, tmp_path: Path
+) -> None:
+    ledger = tmp_path / "pad.beancount"
+    ledger.write_text(
+        f"2026-01-01 open {ACCOUNT}\n2026-01-01 open Equity:Open\n"
+        f"2026-05-30 pad {ACCOUNT} Equity:Open\n2026-05-31 balance {ACCOUNT} 120 TWD\n",
+        encoding="utf-8",
+    )
+    existing, errors, _ = loader.load_file(str(ledger))
+    assert errors == []
+    assert any(isinstance(e, data.Transaction) and e.flag == "P" for e in existing)
+    entries = importer.extract(str(statement), [])
+    importer.deduplicate(entries, existing)
+    assert duplicates(entries)[0] is False
