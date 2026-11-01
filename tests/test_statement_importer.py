@@ -1,4 +1,4 @@
-"""The 交易明細 importer, against xlsx files shaped like the online banking export."""
+"""The 交易明細 importer, against files shaped like the online banking exports."""
 
 from __future__ import annotations
 
@@ -16,8 +16,9 @@ from beancount.parser import printer
 from beangulp.extract import DUPLICATE
 from fava.core.ingest import extract_from_file, load_import_config
 
-from beancount_agent_api.importers import statement as statement_module
-from beancount_agent_api.importers.statement import BOOKED_KEY, ID_KEY, StatementImporter, parse
+from beancount_agent_api.importers import layouts
+from beancount_agent_api.importers.layouts import parse
+from beancount_agent_api.importers.statement import BOOKED_KEY, ID_KEY, StatementImporter
 
 ACCOUNT = "Assets:Bank:Checking"
 TITLE = "測試銀行 - 交易明細"
@@ -25,9 +26,9 @@ FALLBACK = "Expenses:Uncategorized"
 RULES = [("存款息", "Income:Interest"), ("劃撥轉帳", "Assets:Broker:Stocks")]
 HEADER = ["交易日", "帳務日", "摘要", "金額", "餘額", "備註"]
 ROWS = [
-    ["2026/06/01 01:44:44", "2026/06/01", "存款息", 120, 10120, ""],
-    ["2026/06/08 00:52:15", "2026/06/08", "轉帳支取", -5000, 5120, "劃撥轉帳測試股"],
-    ["2026/06/08 00:52:15", "2026/06/08", "CD轉出", -1000, 4120, "網路跨行000-0000"],
+    ["2026/06/01 02:10:00", "2026/06/01", "存款息", 120, 10120, ""],
+    ["2026/06/08 10:20:00", "2026/06/08", "轉帳支取", -5000, 5120, "劃撥轉帳測試股"],
+    ["2026/06/08 10:20:00", "2026/06/08", "CD轉出", -1000, 4120, "網路跨行000-0000"],
 ]
 
 
@@ -125,8 +126,8 @@ def test_extract_writes_one_transaction_per_row(
         (datetime.date(2026, 6, 8), "!", "網路跨行000-0000", FALLBACK),
     ]
     assert [t.postings[0].units.number for t in txns] == [120, -5000, -1000]
-    assert txns[1].meta[ID_KEY] == "2026/06/08 00:52:15 -5000 5120"
-    assert txns[2].meta[ID_KEY] == "2026/06/08 00:52:15 -1000 4120"
+    assert txns[1].meta[ID_KEY] == "2026/06/08 10:20:00 -5000 5120"
+    assert txns[2].meta[ID_KEY] == "2026/06/08 10:20:00 -1000 4120"
 
 
 def test_extract_asserts_the_opening_and_each_day_close(
@@ -274,8 +275,8 @@ def test_two_rows_of_one_amount_need_two_hand_entries(
     importer: StatementImporter, tmp_path: Path
 ) -> None:
     rows = [
-        ["2026/06/15 12:50:27", "2026/06/15", "CD轉出", -1000, 9000, ""],
-        ["2026/06/15 12:51:05", "2026/06/15", "CD轉出", -1000, 8000, ""],
+        ["2026/06/15 13:20:00", "2026/06/15", "CD轉出", -1000, 9000, ""],
+        ["2026/06/15 13:21:00", "2026/06/15", "CD轉出", -1000, 8000, ""],
     ]
     one = importer.extract(str(write_statement(tmp_path / "s.xlsx", rows)), [])
     importer.deduplicate(one, [hand(datetime.date(2026, 6, 15), -1000)])
@@ -334,7 +335,7 @@ def test_identify_says_no_to_a_file_it_cannot_read(
     def unreadable(path: str) -> list[list[str]]:
         raise RuntimeError("File is encrypted, password required for extraction")
 
-    monkeypatch.setattr(statement_module, "_read_rows", unreadable)
+    monkeypatch.setattr(layouts, "read_table", unreadable)
     assert not importer.identify(str(statement))
 
 

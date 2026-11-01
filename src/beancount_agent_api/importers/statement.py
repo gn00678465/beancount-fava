@@ -1,126 +1,30 @@
-"""beangulp importer for one layout of 交易明細 xlsx exported by online banking.
+"""beangulp importer for 交易明細 exported by online banking.
 
-The export is one sheet: a title row, a header row, one row per transaction in
-ascending order, and a footer row with the row count and the export time. The
-title names the bank, so the ledger's import config passes it in.
-
-parse() and identify() read this layout; the rows, balances and dedup work on
-Statement and Row, apart from the sheet line numbers kept as entry metadata. A statement without a running balance, such as a card bill,
-does not fit Row.
+The bank layouts are read in layouts.py; this module turns a Statement into
+transactions and balance assertions and marks the rows the ledger already has.
+The title of the export names the bank, so the ledger's import config passes it in.
 """
 
 from __future__ import annotations
 
 import datetime
-import re
-import xml.etree.ElementTree as ET
-import zipfile
 from collections.abc import Sequence
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 import beangulp
 from beancount.core import data, flags
 from beancount.core.amount import Amount
 from beangulp.extract import DUPLICATE
 
-HEADER = ("交易日", "帳務日", "摘要", "金額", "餘額", "備註")
-COLUMNS = "ABCDEF"
+from beancount_agent_api.importers.layouts import Row, Statement, is_statement, parse
+
 # The bank gives no transaction number. The time, amount and running balance
 # together identify one row, so a re-imported row matches the one already saved.
 ID_KEY = "statement-id"
 BOOKED_KEY = "booking-date"
-SHEET = "xl/worksheets/sheet1.xml"
 # A stock trade is often entered by hand on the trade day while the bank debits
 # it days later; the daily balance assertions catch a pair this window misses.
 MATCH_DAYS = 7
-_M = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-_FOOTER = re.compile(r"共(\d+)筆資料\s*資料日期：(\d{4}/\d{2}/\d{2})(?: \d{2}:\d{2}:\d{2})?")
-
-
-@dataclass(frozen=True)
-class Row:
-    time: str
-    date: datetime.date
-    booked: datetime.date
-    summary: str
-    amount: Decimal
-    balance: Decimal
-    note: str
-
-
-@dataclass(frozen=True)
-class Statement:
-    rows: list[Row]
-    exported: datetime.date
-
-
-def _read_rows(path: str) -> list[list[str]]:
-    with zipfile.ZipFile(path) as archive:
-        sheet = ET.fromstring(archive.read(SHEET))
-    rows = []
-    for row in sheet.iter(f"{_M}row"):
-        cells = dict.fromkeys(COLUMNS, "")
-        for cell in row.iter(f"{_M}c"):
-            column = cell.get("r", "").rstrip("0123456789")
-            if column not in cells:
-                continue
-            if cell.get("t") == "inlineStr":
-                text = "".join(t.text or "" for t in cell.iter(f"{_M}t"))
-            elif cell.get("t") is None:
-                text = cell.findtext(f"{_M}v") or ""
-            else:
-                raise ValueError(f"{cell.get('r')}: unsupported cell type {cell.get('t')!r}")
-            cells[column] = text.strip()
-        rows.append([cells[c] for c in COLUMNS])
-    return rows
-
-
-def _date(text: str) -> datetime.date:
-    return datetime.date.fromisoformat(text.replace("/", "-"))
-
-
-def _decimal(text: str, where: str) -> Decimal:
-    try:
-        return Decimal(text)
-    except InvalidOperation:
-        raise ValueError(f"{where}: {text!r} is not a number") from None
-
-
-def _is_export(rows: list[list[str]], title: str) -> bool:
-    return len(rows) >= 2 and rows[0][0] == title and tuple(rows[1]) == HEADER
-
-
-def parse(path: str, title: str) -> Statement:
-    """Read the statement and check that its rows are complete and in order."""
-    rows = _read_rows(path)
-    if len(rows) < 3 or not _is_export(rows, title):
-        raise ValueError(f"{path} is not a {title!r} export")
-    footer = _FOOTER.fullmatch(rows[-1][0])
-    if footer is None:
-        raise ValueError(f"row {len(rows)}: expected the 共N筆資料 footer, got {rows[-1][0]!r}")
-    parsed = []
-    for line, (time, date, summary, amount, balance, note) in enumerate(rows[2:-1], start=3):
-        # The running balance follows the 交易日 order, so the transaction is
-        # dated by it; 帳務日 can fall on a later business day.
-        row = Row(
-            time=time,
-            date=_date(time.split(" ")[0]),
-            booked=_date(date),
-            summary=summary,
-            amount=_decimal(amount, f"D{line}"),
-            balance=_decimal(balance, f"E{line}"),
-            note=note,
-        )
-        # Each balance must follow from the previous one; a gap means a lost or reordered row.
-        if parsed and parsed[-1].balance + row.amount != row.balance:
-            raise ValueError(
-                f"row {line}: {parsed[-1].balance} + {row.amount} is not the balance {row.balance}"
-            )
-        parsed.append(row)
-    if len(parsed) != int(footer[1]):
-        raise ValueError(f"the footer counts {footer[1]} rows, the sheet has {len(parsed)}")
-    return Statement(parsed, _date(footer[2]))
 
 
 class StatementImporter(beangulp.Importer):
@@ -128,8 +32,10 @@ class StatementImporter(beangulp.Importer):
 
     `title` is the text of the export's first row; it tells this export apart.
     `rules` is a list of (text, account) pairs. The first pair whose text occurs
-    in the row's 摘要 or 備註 gives the other account. A row no rule matches goes
-    to `fallback_account` with the `!` flag, so it stands out on the import page.
+    in the row's description or note gives the other account; a transfer between
+    two of the owner's accounts is matched by the other account's number. A row
+    no rule matches goes to `fallback_account` with the `!` flag, so it stands
+    out on the import page.
     """
 
     def __init__(
@@ -153,23 +59,25 @@ class StatementImporter(beangulp.Importer):
 
     def identify(self, filepath: str) -> bool:
         try:
-            rows = _read_rows(filepath)
+            return is_statement(filepath, self._title)
         except Exception:  # noqa: BLE001
             # fava lists every uploaded file through identify and one exception
             # fails the whole import page, so a file this cannot read is not ours.
             return False
-        return _is_export(rows, self._title)
 
     def account(self, filepath: str) -> str:
         return self._account
 
-    def _transaction(self, filepath: str, line: int, row: Row) -> data.Transaction:
+    def _transaction(self, filepath: str, row: Row) -> data.Transaction:
         text = f"{row.summary} {row.note}"
         other = next((account for needle, account in self._rules if needle in text), None)
         units = Amount(row.amount, self._currency)
-        meta = data.new_metadata(filepath, line, {ID_KEY: f"{row.time} {row.amount} {row.balance}"})
+        meta = data.new_metadata(
+            filepath, row.line, {ID_KEY: f"{row.time} {row.amount} {row.balance}"}
+        )
         if row.booked != row.date:
             meta[BOOKED_KEY] = row.booked
+        # deduplicate reads the first posting back to tell this account's saved rows apart.
         postings = [
             data.Posting(self._account, units, None, None, None, None),
             data.Posting(other or self._fallback, -units, None, None, None, None),
@@ -186,11 +94,11 @@ class StatementImporter(beangulp.Importer):
         if not statement.rows:
             return []
         first = statement.rows[0]
-        starts = {first.date: (3, first.balance - first.amount)}
-        for line, row in enumerate(statement.rows, start=3):
+        starts = {first.date: (first.line, first.balance - first.amount)}
+        for row in statement.rows:
             # The export day may get rows after the export, so its close is unknown.
             if row.date < statement.exported:
-                starts[row.date + datetime.timedelta(days=1)] = (line, row.balance)
+                starts[row.date + datetime.timedelta(days=1)] = (row.line, row.balance)
         return [
             data.Balance(
                 data.new_metadata(filepath, line),
@@ -205,10 +113,7 @@ class StatementImporter(beangulp.Importer):
 
     def extract(self, filepath: str, existing: data.Entries) -> data.Entries:
         statement = parse(filepath, self._title)
-        entries: data.Entries = [
-            self._transaction(filepath, line, row)
-            for line, row in enumerate(statement.rows, start=3)
-        ]
+        entries: data.Entries = [self._transaction(filepath, row) for row in statement.rows]
         return entries + self._balances(filepath, statement)
 
     def _cash(self, entry: data.Transaction) -> Decimal | None:
@@ -217,22 +122,30 @@ class StatementImporter(beangulp.Importer):
             return None
         return sum((u.number for u in units), Decimal(0))
 
+    def _saved_here(self, entry: data.Transaction) -> bool:
+        meta = entry.meta or {}
+        return (
+            ID_KEY in meta and bool(entry.postings) and entry.postings[0].account == self._account
+        )
+
     def deduplicate(self, entries: data.Entries, existing: data.Entries) -> None:
         """Mark rows and balances the ledger already has; fava skips them on save.
 
-        A row saved by an earlier import matches by its id. A transaction without
-        an id (entered by hand or through the agent API) matches a row when its
-        postings on the account sum to the row's amount within MATCH_DAYS days.
+        A row saved by an earlier import of this account matches by its id. Any
+        other transaction (entered by hand, through the agent API, or imported
+        from another account's statement as a transfer to this one) matches a row
+        when its postings on the account sum to the row's amount within
+        MATCH_DAYS days.
         Each such transaction matches one row at most, the nearest in date, so two
         rows of one amount on one day are not both taken for one saved entry.
         """
-        ids = {e.meta[ID_KEY] for e in existing if ID_KEY in (e.meta or {})}
+        txns = [e for e in existing if isinstance(e, data.Transaction)]
+        ids = {e.meta[ID_KEY] for e in txns if self._saved_here(e)}
         balances = {(e.date, e.account, e.amount) for e in existing if isinstance(e, data.Balance)}
         by_amount: dict[Decimal, list[data.Transaction]] = {}
-        for e in existing:
+        for e in txns:
             # A pad's filler transaction is not a saved row of any statement.
-            saved = isinstance(e, data.Transaction) and e.flag != flags.FLAG_PADDING
-            if saved and ID_KEY not in (e.meta or {}):
+            if e.flag != flags.FLAG_PADDING and not self._saved_here(e):
                 cash = self._cash(e)
                 if cash is not None:
                     by_amount.setdefault(cash, []).append(e)
