@@ -6,7 +6,7 @@ requires-python = "==3.13.*"
 dependencies = [
     "beancount==3.2.3",
     "beanprice==2.1.0",
-    "fava==1.30.16",
+    "fava==1.31",
     "pyjwt[crypto]==2.15.1",
 ]
 
