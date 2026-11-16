@@ -16,7 +16,7 @@ from fava.internal_api import get_ledger_data
 from fava.json_api import json_err, json_success
 from flask import Response, request
 
-from beancount_agent_api.core import MAX_TARGETS, REQUIRED
+from beancount_agent_api.core import MAX_TARGETS, REQUIRED, TRADE_REQUIRED
 
 if TYPE_CHECKING:
     from beancount_agent_api.extension import AgentApi
@@ -97,6 +97,10 @@ def _query(ext: AgentApi, arguments: Mapping[str, object]) -> Response:
 
 def _add_transaction(ext: AgentApi, arguments: Mapping[str, object]) -> Response:
     return ext.add(arguments)
+
+
+def _add_trade(ext: AgentApi, arguments: Mapping[str, object]) -> Response:
+    return ext.add_trade(arguments)
 
 
 def _string(description: str) -> dict[str, str]:
@@ -201,6 +205,86 @@ TOOLS = (
             "additionalProperties": False,
         },
         _add_transaction,
+    ),
+    Tool(
+        "add_trade",
+        "Add one purchase of shares: the shares go into holdings at a cost of units times "
+        "price, an optional fee goes to fees_account, and source pays the whole total. The "
+        "entry is written with the ! flag and a person approves it in fava. Send exactly one "
+        "of date or time, and exactly one of total or fee.",
+        {
+            "type": "object",
+            "properties": {
+                "date": _string("Trade date as YYYY-MM-DD."),
+                "time": _string(
+                    "Moment of the trade as RFC 3339 with an offset, such as "
+                    "2026-09-24T09:30:00+08:00; the date is taken in Asia/Taipei."
+                ),
+                "source": _string(
+                    "Account the money leaves, such as the settlement account: the full "
+                    "account name, the full name-zh, or the last segment of name-zh."
+                ),
+                "holdings": _string(
+                    "Account that holds the shares, in the same forms as source; it must not "
+                    'be under the ledger\'s option "name_expenses".'
+                ),
+                "commodity": _string(
+                    "Commodity code of the shares, such as TWETF1. It must differ from the "
+                    "currency, and from the currencies the holdings account lists, if any."
+                ),
+                "units": _string('Number of shares as a positive integer string, such as "5000".'),
+                "price": _string(
+                    "Price per share as a positive decimal string with at most 4 decimals, "
+                    'such as "29.5". Units times price must have at most 2 decimals.'
+                ),
+                "total": _string(
+                    "What source pays in all, fee included, as a decimal string with at most "
+                    '2 decimals, such as "100643". The fee is total minus units times price. '
+                    "Send total or fee, not both."
+                ),
+                "fee": _string(
+                    "The fee alone as a decimal string with at most 2 decimals; source pays "
+                    'units times price plus fee. "0" means no fee. Send total or fee, not both.'
+                ),
+                "fees_account": _string(
+                    "Expense account for the fee, in the same forms as source; its root must be "
+                    'the ledger\'s option "name_expenses" (Expenses by default). Required when '
+                    "the fee is above 0."
+                ),
+                "currency": _string(
+                    "Currency code such as TWD for the cost, fee, and payment; defaults to the "
+                    "ledger's operating currency."
+                ),
+                "narration": _string("Free text without line breaks or control characters."),
+                "payee": _string(
+                    "Who the trade is with, such as the broker; same rules as narration."
+                ),
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tags, each of ASCII letters, digits, and - _ / . only; "
+                    "put other text in meta.",
+                },
+                "meta": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Metadata such as a reconciliation note. Each key starts "
+                    "with a lowercase ASCII letter, followed by ASCII letters, digits, - or _; "
+                    "time, filename, and lineno are reserved. Values follow the narration rules.",
+                },
+                "key": _string(
+                    "Idempotency key: generate one per trade and reuse it on retry, so a retry "
+                    "never writes twice. ASCII letters, digits, and - _ / . only."
+                ),
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "When true, return the entry text without writing it.",
+                },
+            },
+            "required": list(TRADE_REQUIRED),
+            "additionalProperties": False,
+        },
+        _add_trade,
     ),
 )
 

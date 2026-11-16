@@ -13,7 +13,7 @@ description: 在使用者的 beancount 帳本（fava）記帳與查帳。使用�
 
 兩條路徑的結果相同。讀花費只有 curl 路徑。
 
-- 有 MCP tool `list_accounts`、`query`、`add_transaction` 時，用 MCP tool。
+- 有 MCP tool `list_accounts`、`query`、`add_transaction`、`add_trade` 時，用 MCP tool。
 - 沒有這些 tool 時，用 `curl`（8.3 以上）。每個 curl 都以下面這段開頭。curl 自己從環境變數讀取網址與 token，指令中不要寫 `$`，也不要印出 token。你看不到這兩個環境變數，但它們已經設定好。不要先檢查環境，也不要向使用者要網址或 token，直接執行 curl。只有 curl 回報 `Variable 'BEANCOUNT_...' import fail, not set` 時，才請使用者設定該變數。
 
   ```sh
@@ -25,6 +25,7 @@ description: 在使用者的 beancount 帳本（fava）記帳與查帳。使用�
 | 讀帳戶 | `list_accounts` | `--expand-url '{{BEANCOUNT_FAVA_URL}}/api/ledger_data'` |
 | 查交易 | `query`，參數 `query_string` | `-G --data-urlencode 'query_string=<BQL>' --expand-url '{{BEANCOUNT_FAVA_URL}}/api/query'` |
 | 新增交易 | `add_transaction`，參數同右方 JSON | `-X POST -H 'Content-Type: application/json' -d '<JSON>' --expand-url '{{BEANCOUNT_FAVA_URL}}/extension/AgentApi/transactions'` |
+| 記買進股票 | `add_trade`，參數同右方 JSON | `-X POST -H 'Content-Type: application/json' -d '<JSON>' --expand-url '{{BEANCOUNT_FAVA_URL}}/extension/AgentApi/trades'` |
 | 讀一天的花費 | 沒有，有 MCP tool 時也用 curl | `-X POST -H 'Content-Type: application/json' -d '{"date": "2026-10-05"}' --expand-url '{{BEANCOUNT_FAVA_URL}}/extension/AgentApi/spending'` |
 
 直接讀 curl 的 JSON 輸出，不要 pipe 到其他指令。不要送 PUT 或 DELETE 到 `/api/`，也不要開 fava 的網頁路徑。這些請求會得到 403。
@@ -55,6 +56,33 @@ description: 在使用者的 beancount 帳本（fava）記帳與查帳。使用�
 4. 把回應中的 `entry` 原文給使用者看，並說明交易是 `!`，要由使用者在網頁核准。
 
 一次記多筆時，每筆各自產生 key。查交易只做一次，查詢條件涵蓋所有日期。
+
+## 記買進股票
+
+使用者記一筆買進股票或 ETF（例如「今天買 <商品> <股數> 股，單價 <單價>，扣款 <總額>」）時，不用 `add_transaction`。它沒有股數與成本欄位，只能把一筆台幣轉進持倉帳戶，之後算不出持股與成本。改用 `add_trade`，或 curl 的 `trades`。
+
+1. 先查帳本以前的買股交易是怎麼記的，例如 `SELECT date, narration, account, position WHERE narration ~ '買進' ORDER BY date DESC LIMIT 6`，找出持倉帳戶、商品代號（例如 `TWETF1`）與手續費帳戶。找不到時問使用者，不要猜。
+2. 查同一天、同金額的交易，規則同「記一筆帳」的步驟 1 與 2，金額用付款總額的負數。
+3. 送出：
+   - `source`：付款帳戶，例如交割戶。使用者說的別稱照使用者的用詞送出。
+   - `holdings`：持有股票的帳戶，不是費用帳戶。
+   - `commodity`：商品代號，照步驟 1 查到的寫法。
+   - `units`：股數，正整數字串，例如 `"1000"`。
+   - `price`：每股單價，字串，最多 4 位小數，例如 `"100.5"`。股數乘單價必須剛好是最多兩位小數，不會被四捨五入。
+   - `total` 或 `fee` 擇一：使用者給的是實際扣款總額時送 `total`，給的是手續費時送 `fee`。`total` 含手續費，手續費由伺服器算。不要自己用公式推算手續費；使用者沒給扣款總額與手續費時，先問。
+   - `fees_account`：手續費大於 0 時必填，是費用帳戶，照步驟 1 查到的寫法。
+   - `date` 或 `time`、`narration`、`payee`、`tags`、`meta`、`key`、`dry_run`：規則同 `add_transaction`。`date` 用成交日；使用者只說扣款日（T+2）時，問成交日。
+4. 把回應中的 `entry` 原文給使用者看，說明交易是 `!`，要由使用者在網頁核准。
+
+回應判讀同下表。`trades` 與 `add_transaction` 共用 key，同一個 key 不能用在兩邊。另外：
+
+| 回應 | 意思與動作 |
+|---|---|
+| 422 `total_below_cost` | `total` 小於股數乘單價。問使用者實際扣款總額，不要自己調整。 |
+| 422 `inexact_cost` | 股數乘單價超過兩位小數。確認單價與股數有沒有打錯，問使用者。 |
+| 422 `total_or_fee` | `total` 與 `fee` 都送了或都沒送。只留一個重送，沿用同一個 key。 |
+| 422 `expense_account`、`not_expense_account`、`same_account` | `holdings` 不能是費用帳戶，`fees_account` 要是費用帳戶，三個帳戶要不同。告訴使用者，列出相近的帳戶讓使用者選。不要自己換帳戶。 |
+| 422 `currency_not_allowed`，`field` 是 `commodity` | 持倉帳戶的 `open` 沒有列這個商品。告訴使用者，問要用哪個持倉帳戶。 |
 
 ## 讀回應
 

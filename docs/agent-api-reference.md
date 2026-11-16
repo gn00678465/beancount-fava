@@ -223,6 +223,85 @@ fava 寫入前不檢查整本帳。201 的 `errors` 是寫入前後 fava 的錯�
 | `not_expense_account` | `targets[<n>].account` | 帳戶的根名稱不是 `option "name_expenses"`。 |
 | `currency_not_allowed` | `currency` | 帳戶不接受這個幣別。 |
 
+## `POST /<bfile>/extension/AgentApi/trades`
+
+新增一筆買進股票的交易。股票以成本記進 `holdings`，手續費記進 `fees_account`，`source` 付出股款加手續費。一般的轉帳與費用用 `transactions`，它沒有股數與成本。body 是 JSON 物件，`Content-Type` 是 `application/json`。
+
+### 欄位
+
+| 欄位 | 必填 | 型別 | 規則 |
+|---|---|---|---|
+| `source` | 是 | string | 付款的帳戶，例如交割戶。格式同 `transactions` 的 `source`。 |
+| `holdings` | 是 | string | 持有股票的帳戶。格式同 `source`。不能在 `option "name_expenses"` 的根底下。帳戶的 `open` 有列出幣別時，`commodity` 必須在其中；沒有列出時不限制。 |
+| `commodity` | 是 | string | 股票的商品代號，例如 `TWETF1`。格式同 beancount 的幣別代碼（大寫英數字，可含 `'._-`），不能與 `currency` 相同。 |
+| `units` | 是 | string | 股數。`[1-9][0-9]{0,11}`，正整數。 |
+| `price` | 是 | string | 每股單價。`[0-9]{1,9}(\.[0-9]{1,4})?`，大於 0。 |
+| `total` | `total` 與 `fee` 擇一 | string | `source` 實際付出的總額，含手續費。`[0-9]{1,15}(\.[0-9]{1,2})?`，不能小於股款。手續費是 `total` 減去股款。 |
+| `fee` | `total` 與 `fee` 擇一 | string | 只有手續費。格式同 `total`，可以是 `"0"`。`source` 付出股款加 `fee`。 |
+| `fees_account` | 手續費大於 0 時必填 | string | 記手續費的費用帳戶。格式同 `source`，根名稱必須等於 `option "name_expenses"`。手續費是 0 時可以不送，送了仍會檢查。 |
+| `key` | 是 | string | 規則同 `transactions`。與 `transactions` 共用同一組 `^ik-<key>` link，所以同一個 key 不能一邊記一般交易、一邊記買進。 |
+| `date` | `date` 與 `time` 擇一 | string | 成交日，`YYYY-MM-DD`。規則同 `transactions`。 |
+| `time` | `date` 與 `time` 擇一 | string | 規則同 `transactions`。 |
+| `currency` | 否 | string | 成本、手續費與付款的幣別。預設是第一個 `operating_currency`。`source` 必須接受這個幣別；有手續費時 `fees_account` 也要。 |
+| `narration`、`payee`、`tags`、`meta`、`dry_run` | 否 | | 規則同 `transactions`。 |
+
+其他規則：
+
+- 不接受上表以外的欄位。
+- 股數乘單價必須剛好是最多兩位小數，且整數部分最多 15 位。不會四捨五入，否則成本與付款會差一個零頭，交易就不平衡。
+- `source`、`holdings` 與（有送時）`fees_account` 必須是三個不同的帳戶，別名解析後也算。
+- 帳戶在成交日必須是開啟的，規則同 `transactions`。
+
+### 寫入的交易
+
+交易一律是 `!` flag。第一條是 `holdings`，股數加成本 `{單價 幣別, 成交日}`。手續費大於 0 時第二條是 `fees_account`。最後一條是 `source`，金額是股款加手續費取負號。成本日期是成交日，所以經核准與重新載入後，交易文字不變。三條相加為零。tag 與 metadata 的排序同 `transactions`。
+
+請求（測試用的虛構帳戶；「交割戶」是 `Assets:Broker:Settlement` 的 `name-zh` 最後一段）：
+
+```json
+{
+  "date": "2026-09-24",
+  "source": "交割戶",
+  "holdings": "Assets:Broker:Holdings",
+  "commodity": "TWETF1",
+  "units": "1000",
+  "price": "100.5",
+  "total": "100643",
+  "fees_account": "Expenses:Investing:Fees",
+  "key": "t1"
+}
+```
+
+寫入的交易：
+
+```beancount
+2026-09-24 ! ^ik-t1
+  Assets:Broker:Holdings                               1000 TWETF1 {100.5 TWD, 2026-09-24}
+  Expenses:Investing:Fees                               143 TWD
+  Assets:Broker:Settlement                          -100643 TWD
+```
+
+改送 `"fee": "143"` 而不送 `total`，寫入同一筆交易，以同一個 key 重送也回 200。`"fee": "0"` 時不寫手續費那條，`source` 付 `-100500 TWD`。
+
+### 處理順序與回應
+
+處理順序、冪等與回應的狀態碼都和 `transactions` 相同：同一個 key 與相同的交易文字回 200 `created: false`，不同的交易回 409 `key_conflict`，`dry_run` 回預覽，另一筆寫入未完成回 503 `busy`。201 的 `errors` 是寫入前後 fava 的錯誤數量。
+
+422 的 `code`，`transactions` 已列的（`invalid_body`、`unknown_field`、`invalid_type`、`missing`、`invalid_key`、`date_or_time`、`invalid_date`、`invalid_time`、`date_out_of_range`、`invalid_currency`、`invalid_narration`、`invalid_payee`、`invalid_tag`、`invalid_meta_key`、`reserved_meta_key`、`invalid_meta_value`、`invalid_account_name`、`unknown_account`、`ambiguous_account`、`account_not_open`、`account_closed`、`same_account`、`not_expense_account`、`currency_not_allowed`）意思相同，另有：
+
+| 422 的 `code` | `field` | 原因 |
+|---|---|---|
+| `total_or_fee` | `total` | `total` 與 `fee` 都有或都沒有。 |
+| `invalid_commodity` | `commodity` | 不是商品代號，或與 `currency` 相同。 |
+| `invalid_units` | `units` | 不是最多 12 位的正整數。 |
+| `invalid_price` | `price` | 格式錯誤、超過 4 位小數、整數超過 9 位或不大於 0。 |
+| `inexact_cost` | `price` | 股數乘單價超過兩位小數或超過 15 位整數。 |
+| `invalid_amount` | `total` 或 `fee` | 格式錯誤、超過兩位小數，或加總超過 15 位整數。 |
+| `total_below_cost` | `total` | `total` 小於股數乘單價。 |
+| `expense_account` | `holdings` | 持倉帳戶在費用帳戶的根底下。 |
+
+`missing` 的 `field` 另可能是 `holdings`、`commodity`、`units`、`price` 或 `fees_account`（手續費大於 0 卻沒送）。`same_account` 的 `field` 是 `holdings` 或 `fees_account`。`currency_not_allowed` 的 `field` 是 `commodity`（持倉帳戶有列出幣別，但不含這個商品）或 `currency`。`not_expense_account` 的 `field` 是 `fees_account`。
+
 ## `POST /<bfile>/extension/AgentApi/spending`
 
 讀一天的交易與那天所在月份的費用合計，包含待核准（`!`）與已核准（`*`）的交易。這個端點只讀不寫。body 是 JSON 物件，`Content-Type` 是 `application/json`。
@@ -428,6 +507,7 @@ flowchart TD
 | `list_accounts` | 無 | 與 `GET /<bfile>/api/ledger_data` 的 body 相同。 |
 | `query` | `query_string`（BQL，必填） | 與 `GET /<bfile>/api/query` 的 body 相同，但沒有 fava 的篩選條件。 |
 | `add_transaction` | 與 `POST transactions` 的欄位相同，包含 `payee`、`tags`、`meta`、`targets`。`inputSchema` 的 `required` 只有 `source` 與 `key`，`target` 加 `amount` 與 `targets` 擇一寫在說明中。 | 與 `POST transactions` 的 body 相同。 |
+| `add_trade` | 與 `POST trades` 的欄位相同。`inputSchema` 的 `required` 是 `source`、`holdings`、`commodity`、`units`、`price`、`key`，`total` 與 `fee` 擇一、`date` 與 `time` 擇一寫在說明中。 | 與 `POST trades` 的 body 相同。 |
 
 `tools/call` 的結果有三個欄位。
 

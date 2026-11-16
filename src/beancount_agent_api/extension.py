@@ -6,8 +6,9 @@ import logging
 import os
 import re
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from beancount.core.data import Directive, Transaction
@@ -20,13 +21,17 @@ from flask import Response, jsonify, request
 from beancount_agent_api import mcp
 from beancount_agent_api.core import (
     Accounts,
+    AddRequest,
     ApproveItem,
     Rejection,
+    TradeRequest,
+    build_trade,
     build_transaction,
     flag_offset,
     parse_add_request,
     parse_approve_request,
     parse_spending_request,
+    parse_trade_request,
     spending,
 )
 
@@ -57,6 +62,10 @@ class AgentApi(FavaExtensionBase):
     @extension_endpoint("transactions", ["POST"])
     def transactions(self) -> Response:
         return self.add(request.get_json(silent=True))
+
+    @extension_endpoint("trades", ["POST"])
+    def trades(self) -> Response:
+        return self.add_trade(request.get_json(silent=True))
 
     @extension_endpoint("spending", ["POST"])
     def spending_endpoint(self) -> Response:
@@ -265,15 +274,37 @@ class AgentApi(FavaExtensionBase):
         return mcp.handle(self)
 
     def add(self, raw: object) -> Response:
+        return self._locked_write(raw, parse_add_request, build_transaction)
+
+    def add_trade(self, raw: object) -> Response:
+        return self._locked_write(raw, parse_trade_request, build_trade)
+
+    def _locked_write(
+        self,
+        raw: object,
+        parse: Callable[
+            [object, Accounts, datetime.tzinfo, datetime.date],
+            AddRequest | TradeRequest | Rejection,
+        ],
+        build: Callable[[Any], Transaction],
+    ) -> Response:
         if not _write_lock.acquire(timeout=LOCK_TIMEOUT):
             busy = Rejection("", "busy", "Another write is still running; retry with the same key.")
             return _error(busy, 503)
         try:
-            return self._add(raw)
+            return self._write(raw, parse, build)
         finally:
             _write_lock.release()
 
-    def _add(self, raw: object) -> Response:
+    def _write(
+        self,
+        raw: object,
+        parse: Callable[
+            [object, Accounts, datetime.tzinfo, datetime.date],
+            AddRequest | TradeRequest | Rejection,
+        ],
+        build: Callable[[Any], Transaction],
+    ) -> Response:
         ledger = self.ledger
         ledger.changed()
         accounts = Accounts.from_directives(
@@ -283,10 +314,10 @@ class AgentApi(FavaExtensionBase):
             ledger.options["name_expenses"],
         )
         today = datetime.datetime.now(TZ).date()
-        req = parse_add_request(raw, accounts, TZ, today)
+        req = parse(raw, accounts, TZ, today)
         if isinstance(req, Rejection):
             return _error(req, 422)
-        txn = build_transaction(req)
+        txn = build(req)
         text = self._render(txn)
         existing = self._existing(req.link)
         if existing is not None:

@@ -20,7 +20,7 @@ from fava.core import FavaLedger
 from fava.core.file import FileModule
 
 from beancount_agent_api import extension
-from beancount_agent_api.core import FIELDS
+from beancount_agent_api.core import FIELDS, TRADE_FIELDS
 
 AGENT_LEDGER = REPO / "tests" / "fixtures" / "agent-ledger"
 TXNS = AGENT_LEDGER / "txns" / "2026.beancount"
@@ -206,7 +206,7 @@ def test_mcp_over_http(fava: Fava) -> None:
 
     status, body = fava.mcp("tools/list")
     names = [tool["name"] for tool in body["result"]["tools"]]
-    assert (status, names) == (200, ["list_accounts", "query", "add_transaction"])
+    assert (status, names) == (200, ["list_accounts", "query", "add_transaction", "add_trade"])
 
     status, body = fava.mcp("tools/call", {"name": "add_transaction", "arguments": DINNER})
     assert (status, body["result"]["isError"]) == (200, False)
@@ -251,6 +251,14 @@ class InProcess:
         )
         return response.status_code, response.get_json()
 
+    def trade(self, body: object) -> tuple[int, Any]:
+        response = self.app.test_client().post(
+            "/agent/extension/AgentApi/trades",
+            data=json.dumps(body),
+            content_type="application/json",
+        )
+        return response.status_code, response.get_json()
+
     def get(self, path: str, **query: str) -> Any:
         return self.app.test_client().get(f"/agent{path}", query_string=query)
 
@@ -275,6 +283,162 @@ def in_process(tmp_path: Path) -> InProcess:
     shutil.copytree(AGENT_LEDGER, tmp_path / "ledger")
     app = create_app([str(tmp_path / "ledger" / "main.beancount")], poll_watcher=True)
     return InProcess(app, tmp_path / "ledger" / "txns" / "2026.beancount")
+
+
+BROKER_OPENS = """
+2026-01-01 open Assets:Broker:Settlement TWD
+  name-zh: "券商/交割戶"
+2026-01-01 open Assets:Broker:Holdings
+2026-01-01 open Expenses:Investing:Fees TWD
+"""
+BUY = {
+    "date": "2026-09-24",
+    "source": "交割戶",
+    "holdings": "Assets:Broker:Holdings",
+    "commodity": "TWETF1",
+    "units": "1000",
+    "price": "100.5",
+    "total": "100643",
+    "fees_account": "Expenses:Investing:Fees",
+    "key": "t1",
+}
+BUY_ENTRY = (
+    "2026-09-24 ! ^ik-t1\n"
+    "  Assets:Broker:Holdings                               1000 TWETF1 {100.5 TWD, 2026-09-24}\n"
+    "  Expenses:Investing:Fees                               143 TWD\n"
+    "  Assets:Broker:Settlement                          -100643 TWD\n"
+)
+
+
+@pytest.fixture
+def broker(tmp_path: Path) -> InProcess:
+    shutil.copytree(AGENT_LEDGER, tmp_path / "ledger")
+    with (tmp_path / "ledger" / "main.beancount").open("a", encoding="utf-8") as ledger:
+        ledger.write(BROKER_OPENS)
+    app = create_app([str(tmp_path / "ledger" / "main.beancount")], poll_watcher=True)
+    return InProcess(app, tmp_path / "ledger" / "txns" / "2026.beancount")
+
+
+def test_trade_appends_once_per_key(broker: InProcess) -> None:
+    original = broker.txns.read_text(encoding="utf-8")
+
+    assert broker.trade(BUY) == (
+        201,
+        {
+            "created": True,
+            "link": "ik-t1",
+            "entry": BUY_ENTRY,
+            "errors": {"before": 0, "after": 0},
+        },
+    )
+    assert broker.txns.read_text(encoding="utf-8") == original + "\n" + BUY_ENTRY
+
+    # The retry meets the entry as the loader booked it, and still prints the same text.
+    assert broker.trade(BUY) == (200, {"created": False, "link": "ik-t1", "entry": BUY_ENTRY})
+    # The fee form of the same trade is the same transaction.
+    fee_form = {k: v for k, v in BUY.items() if k != "total"} | {"fee": "143"}
+    assert broker.trade(fee_form)[0] == 200
+    assert broker.txns.read_text(encoding="utf-8") == original + "\n" + BUY_ENTRY
+
+
+def test_trade_balances_in_the_ledger(broker: InProcess) -> None:
+    assert broker.trade(BUY)[0] == 201
+    status, body = broker.trade({**BUY, "key": "t2", "date": "2026-09-25"})
+    assert (status, body["errors"]) == (201, {"before": 0, "after": 0})
+    rows = broker.get(
+        "/api/query",
+        query_string="SELECT account, sum(position) WHERE account ~ 'Broker' GROUP BY account",
+    ).get_json()["data"]["rows"]
+    assert {row[0] for row in rows} == {"Assets:Broker:Holdings", "Assets:Broker:Settlement"}
+
+
+def test_trade_without_a_fee_writes_two_postings(broker: InProcess) -> None:
+    body = {k: v for k, v in BUY.items() if k not in ("total", "fees_account")} | {"fee": "0"}
+    status, result = broker.trade(body)
+    assert status == 201
+    assert result["entry"] == (
+        "2026-09-24 ! ^ik-t1\n"
+        "  Assets:Broker:Holdings                               1000 TWETF1 {100.5 TWD, 2026-09-24}\n"
+        "  Assets:Broker:Settlement                          -100500 TWD\n"
+    )
+
+
+def test_trade_dry_run_shows_the_entry_without_writing(broker: InProcess) -> None:
+    original = broker.txns.read_text(encoding="utf-8")
+
+    assert broker.trade({**BUY, "dry_run": True}) == (
+        200,
+        {"created": False, "dry_run": True, "link": "ik-t1", "entry": BUY_ENTRY},
+    )
+    assert broker.txns.read_text(encoding="utf-8") == original
+
+
+def test_trade_key_reused_for_another_trade(broker: InProcess) -> None:
+    assert broker.trade(BUY)[0] == 201
+    status, body = broker.trade({**BUY, "units": "900", "total": "90593"})
+    assert (status, body["error"]["code"], body["entry"]) == (409, "key_conflict", BUY_ENTRY)
+    assert broker.txns.read_text(encoding="utf-8").count("^ik-t1") == 1
+
+
+def test_trade_and_add_share_the_key(broker: InProcess) -> None:
+    assert broker.trade(BUY)[0] == 201
+    status, body = broker.add({**DINNER, "key": "t1"})
+    assert (status, body["error"]["code"]) == (409, "key_conflict")
+
+
+@pytest.mark.parametrize(
+    ("changes", "field", "code"),
+    [
+        ({"units": "1000.5"}, "units", "invalid_units"),
+        ({"price": "29.555", "units": "1", "total": "30"}, "price", "inexact_cost"),
+        ({"total": "100499"}, "total", "total_below_cost"),
+        ({"fee": "143"}, "total", "total_or_fee"),
+        ({"fees_account": "Assets:Broker:Holdings"}, "fees_account", "not_expense_account"),
+        ({"holdings": "Expenses:Investing:Fees"}, "holdings", "expense_account"),
+        ({"holdings": "Assets:Broker:Settlement"}, "holdings", "same_account"),
+        ({"source": "Assets:Broker:Nowhere"}, "source", "unknown_account"),
+        ({"target": "晚餐"}, "target", "unknown_field"),
+    ],
+)
+def test_trade_rejections_write_nothing(
+    broker: InProcess, changes: dict[str, str], field: str, code: str
+) -> None:
+    original = broker.txns.read_text(encoding="utf-8")
+
+    status, body = broker.trade({**BUY, **changes})
+    assert (status, body["error"]["field"], body["error"]["code"]) == (422, field, code)
+    assert broker.txns.read_text(encoding="utf-8") == original
+
+
+def test_trade_rejects_a_body_that_is_not_an_object(broker: InProcess) -> None:
+    status, body = broker.trade([BUY])
+    assert (status, body["error"]["code"]) == (422, "invalid_body")
+
+
+def test_mcp_tools_list_has_add_trade(broker: InProcess) -> None:
+    tools = {tool["name"]: tool for tool in broker.result(rpc("tools/list"))["tools"]}
+    schema = tools["add_trade"]["inputSchema"]
+    assert set(schema["properties"]) == set(TRADE_FIELDS)
+    assert schema["required"] == ["source", "holdings", "commodity", "units", "price", "key"]
+    assert schema["additionalProperties"] is False
+
+
+def test_mcp_add_trade_writes_the_entry(broker: InProcess) -> None:
+    result = broker.result(call("add_trade", BUY))
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "created": True,
+        "link": "ik-t1",
+        "entry": BUY_ENTRY,
+        "errors": {"before": 0, "after": 0},
+    }
+    assert broker.trade(BUY) == (200, {"created": False, "link": "ik-t1", "entry": BUY_ENTRY})
+
+
+def test_mcp_add_trade_rejection_is_a_tool_error(broker: InProcess) -> None:
+    result = broker.result(call("add_trade", {**BUY, "total": "1"}))
+    assert result["isError"] is True
+    assert result["structuredContent"]["error"]["code"] == "total_below_cost"
 
 
 def test_retry_before_the_reload_lands(in_process: InProcess, monkeypatch: Any) -> None:
@@ -392,7 +556,7 @@ def test_mcp_discover(in_process: InProcess) -> None:
 def test_mcp_tools_list(in_process: InProcess) -> None:
     result = in_process.result(rpc("tools/list"))
     tools = {tool["name"]: tool for tool in result["tools"]}
-    assert list(tools) == ["list_accounts", "query", "add_transaction"]
+    assert list(tools) == ["list_accounts", "query", "add_transaction", "add_trade"]
     assert (result["resultType"], result["ttlMs"], result["cacheScope"]) == (
         "complete",
         3600000,
