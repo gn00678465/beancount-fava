@@ -18,11 +18,14 @@ from beancount_agent_api.core import (
     ApproveItem,
     Rejection,
     Target,
+    TradeRequest,
+    build_trade,
     build_transaction,
     flag_offset,
     parse_add_request,
     parse_approve_request,
     parse_spending_request,
+    parse_trade_request,
     spending,
 )
 
@@ -603,3 +606,206 @@ def test_flag_offset_finds_the_header_flag(data: bytes, lineno: int, flag_at: in
 )
 def test_flag_offset_refuses_other_lines(data: bytes, lineno: int) -> None:
     assert flag_offset(data, lineno) is None
+
+
+BROKER = """
+option "operating_currency" "TWD"
+2026-01-01 open Assets:Broker:Settlement TWD
+  name-zh: "券商/交割戶"
+2026-01-01 open Assets:Broker:Holdings
+2026-01-01 open Assets:Broker:Locked ETFA
+2026-01-01 open Assets:Broker:UsCash USD
+2026-01-01 open Expenses:Investing:Fees TWD
+2026-01-01 open Expenses:Investing:UsFees USD
+"""
+BUY = {
+    "date": "2026-09-24",
+    "source": "交割戶",
+    "holdings": "Assets:Broker:Holdings",
+    "commodity": "TWETF1",
+    "units": "1000",
+    "price": "100.5",
+    "total": "100643",
+    "fees_account": "Expenses:Investing:Fees",
+    "key": "t1",
+}
+
+
+@pytest.fixture(scope="module")
+def broker() -> Accounts:
+    entries, errors, options = loader.load_string(BROKER)
+    assert errors == []
+    return Accounts.from_directives(
+        [entry for entry in entries if isinstance(entry, Open)],
+        [entry for entry in entries if isinstance(entry, Close)],
+        options["operating_currency"],
+        options["name_expenses"],
+    )
+
+
+def trade(broker: Accounts, **changes: object) -> TradeRequest | Rejection:
+    raw = {**BUY, **changes}
+    return parse_trade_request({k: v for k, v in raw.items() if v is not None}, broker, TZ, TODAY)
+
+
+def trade_code(result: TradeRequest | Rejection) -> tuple[str, str]:
+    assert isinstance(result, Rejection), result
+    return result.field, result.code
+
+
+def test_trade_derives_the_fee_from_the_total(broker: Accounts) -> None:
+    assert trade(broker) == TradeRequest(
+        date=datetime.date(2026, 9, 24),
+        time=None,
+        source="Assets:Broker:Settlement",
+        holdings="Assets:Broker:Holdings",
+        fees_account="Expenses:Investing:Fees",
+        commodity="TWETF1",
+        units=Decimal(1000),
+        price=Decimal("100.5"),
+        fee=Decimal(143),
+        currency="TWD",
+        narration="",
+        payee=None,
+        tags=frozenset(),
+        meta=(),
+        key="t1",
+        dry_run=False,
+    )
+
+
+def test_trade_fee_form_gives_the_same_request(broker: Accounts) -> None:
+    assert trade(broker, total=None, fee="143") == trade(broker)
+
+
+def test_trade_entry_balances_and_keeps_the_cost(broker: Accounts) -> None:
+    result = trade(broker, narration="buy", payee="Broker", tags=["etf"])
+    assert isinstance(result, TradeRequest), result
+    assert to_string(build_trade(result), 61, 2) == (
+        '2026-09-24 ! "Broker" "buy" #etf ^ik-t1\n'
+        "  Assets:Broker:Holdings                               1000 TWETF1 {100.5 TWD, 2026-09-24}\n"
+        "  Expenses:Investing:Fees                               143 TWD\n"
+        "  Assets:Broker:Settlement                          -100643 TWD\n"
+    )
+    postings = build_trade(result).postings
+    cost = postings[0].units.number * postings[0].cost.number_per
+    assert cost + postings[1].units.number + postings[2].units.number == 0
+
+
+def test_trade_without_a_fee_has_two_postings(broker: Accounts) -> None:
+    result = trade(broker, total=None, fee="0", fees_account=None)
+    assert isinstance(result, TradeRequest), result
+    postings = build_trade(result).postings
+    assert [p.account for p in postings] == ["Assets:Broker:Holdings", "Assets:Broker:Settlement"]
+    assert postings[1].units.number == -100500
+
+
+def test_trade_total_equal_to_the_cost_means_no_fee(broker: Accounts) -> None:
+    result = trade(broker, total="100500", fees_account=None)
+    assert isinstance(result, TradeRequest), result
+    assert (result.fee, len(build_trade(result).postings)) == (0, 2)
+
+
+def test_trade_time_is_written_as_local_metadata(broker: Accounts) -> None:
+    result = trade(broker, date=None, time="2026-09-24T01:30:00Z")
+    assert isinstance(result, TradeRequest), result
+    assert (result.date, result.time) == (datetime.date(2026, 9, 24), "09:30:00")
+    assert dict(build_trade(result).meta) == {"time": "09:30:00"}
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        ({"holdings": None}, ("holdings", "missing")),
+        ({"commodity": None}, ("commodity", "missing")),
+        ({"units": None}, ("units", "missing")),
+        ({"price": None}, ("price", "missing")),
+        ({"total": None}, ("total", "total_or_fee")),
+        ({"fee": "143"}, ("total", "total_or_fee")),
+        ({"fees_account": None}, ("fees_account", "missing")),
+        ({"amount": "1"}, ("amount", "unknown_field")),
+        ({"units": 1000}, ("units", "invalid_type")),
+        ({"commodity": "twetf1"}, ("commodity", "invalid_commodity")),
+        ({"commodity": "TWD"}, ("commodity", "invalid_commodity")),
+        ({"units": "0"}, ("units", "invalid_units")),
+        ({"units": "1000.5"}, ("units", "invalid_units")),
+        ({"units": "-5"}, ("units", "invalid_units")),
+        ({"units": "1" * 13}, ("units", "invalid_units")),
+        ({"price": "0"}, ("price", "invalid_price")),
+        ({"price": "29.12345"}, ("price", "invalid_price")),
+        ({"price": "1" * 10}, ("price", "invalid_price")),
+        ({"price": "1e3"}, ("price", "invalid_price")),
+        ({"units": "1", "price": "29.555", "total": "30"}, ("price", "inexact_cost")),
+        ({"units": "1", "price": "0.0001", "total": "1"}, ("price", "inexact_cost")),
+        ({"total": "100499"}, ("total", "total_below_cost")),
+        ({"total": "100643.123"}, ("total", "invalid_amount")),
+        ({"total": None, "fee": "-1"}, ("fee", "invalid_amount")),
+        ({"total": None, "fee": "1" * 16}, ("fee", "invalid_amount")),
+        ({"date": "2026-09-24", "time": "2026-09-24T01:30:00Z"}, ("date", "date_or_time")),
+        ({"key": "a b"}, ("key", "invalid_key")),
+        ({"currency": "twd"}, ("currency", "invalid_currency")),
+        ({"currency": "TWETF1"}, ("commodity", "invalid_commodity")),
+        ({"narration": "a\nb"}, ("narration", "invalid_narration")),
+        ({"source": "Assets:Broker:Nowhere"}, ("source", "unknown_account")),
+        ({"holdings": "Assets:Broker:Nowhere"}, ("holdings", "unknown_account")),
+        ({"date": "2025-12-31"}, ("source", "account_not_open")),
+        ({"holdings": "Expenses:Investing:Fees"}, ("holdings", "expense_account")),
+        ({"fees_account": "Assets:Broker:Locked"}, ("fees_account", "not_expense_account")),
+        ({"holdings": "券商/交割戶"}, ("holdings", "same_account")),
+        ({"fees_account": "Assets:Broker:Holdings"}, ("fees_account", "not_expense_account")),
+        ({"holdings": "Assets:Broker:Locked"}, ("commodity", "currency_not_allowed")),
+        ({"source": "Assets:Broker:UsCash"}, ("currency", "currency_not_allowed")),
+        ({"fees_account": "Expenses:Investing:UsFees"}, ("currency", "currency_not_allowed")),
+    ],
+)
+def test_trade_rejections(
+    broker: Accounts, changes: dict[str, object], expected: tuple[str, str]
+) -> None:
+    assert trade_code(trade(broker, **changes)) == expected
+
+
+def test_trade_holdings_may_list_its_commodity(broker: Accounts) -> None:
+    result = trade(broker, holdings="Assets:Broker:Locked", commodity="ETFA")
+    assert isinstance(result, TradeRequest), result
+    assert result.holdings == "Assets:Broker:Locked"
+
+
+def test_trade_fee_in_another_currency_needs_that_currency(broker: Accounts) -> None:
+    result = trade(
+        broker,
+        source="Assets:Broker:UsCash",
+        fees_account="Expenses:Investing:UsFees",
+        currency="USD",
+        total="100600",
+    )
+    assert isinstance(result, TradeRequest), result
+    assert result.currency == "USD"
+
+
+def test_trade_unused_fees_account_needs_no_currency_match(broker: Accounts) -> None:
+    result = trade(broker, fees_account="Expenses:Investing:UsFees", total="100500")
+    assert isinstance(result, TradeRequest), result
+    assert result.fee == 0
+
+
+def test_trade_same_source_and_fees_account_is_rejected(broker: Accounts) -> None:
+    assert trade_code(trade(broker, source="Expenses:Investing:Fees")) == (
+        "fees_account",
+        "same_account",
+    )
+
+
+def test_trade_ambiguous_account_lists_candidates() -> None:
+    entries, errors, _ = loader.load_string(
+        BROKER + '2026-01-01 open Assets:Broker:Other TWD\n  name-zh: "券商/交割戶"\n'
+    )
+    assert errors == []
+    accounts = Accounts.from_directives(
+        [entry for entry in entries if isinstance(entry, Open)], [], ["TWD"], "Expenses"
+    )
+    assert trade(accounts) == Rejection(
+        "source",
+        "ambiguous_account",
+        "'交割戶' matches more than one account; send one of the candidates.",
+        ("Assets:Broker:Other", "Assets:Broker:Settlement"),
+    )

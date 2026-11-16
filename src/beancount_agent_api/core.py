@@ -11,6 +11,7 @@ from typing import Any
 from beancount.core import account as account_name
 from beancount.core import amount as beancount_amount
 from beancount.core.data import Close, Open, Posting, Transaction
+from beancount.core.position import CostSpec
 from fava.beans import create
 from fava.beans.funcs import hash_entry
 
@@ -21,6 +22,9 @@ class Account:
     open_date: datetime.date
     close_date: datetime.date | None
     currencies: frozenset[str]
+    # The currencies the Open directive itself lists; empty when it lists none. `currencies`
+    # falls back to the operating currencies, which says nothing about a stock commodity.
+    declared: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,7 @@ class Accounts:
                 open_date=open_.date,
                 close_date=close_dates.get(name),
                 currencies=frozenset(open_.currencies or operating_currencies),
+                declared=frozenset(open_.currencies or ()),
             )
             aliases = {name}
             name_zh = open_.meta.get("name-zh")
@@ -89,6 +94,39 @@ class AddRequest:
     @property
     def link(self) -> str:
         return f"ik-{self.key}"
+
+
+@dataclass(frozen=True)
+class TradeRequest:
+    date: datetime.date
+    time: str | None
+    source: str
+    holdings: str
+    # None when the trade has no fee.
+    fees_account: str | None
+    commodity: str
+    units: Decimal
+    price: Decimal
+    fee: Decimal
+    currency: str
+    narration: str
+    payee: str | None
+    tags: frozenset[str]
+    meta: tuple[tuple[str, str], ...]
+    key: str
+    dry_run: bool
+
+    @property
+    def link(self) -> str:
+        return f"ik-{self.key}"
+
+    @property
+    def cost(self) -> Decimal:
+        return self.units * self.price
+
+    @property
+    def total(self) -> Decimal:
+        return _plain(self.cost + self.fee)
 
 
 @dataclass(frozen=True)
@@ -136,6 +174,33 @@ FIELD_TYPES: Mapping[str, tuple[Callable[[object], bool], str]] = {
     "dry_run": (_is_boolean, "boolean"),
 }
 FIELDS = tuple(FIELD_TYPES)
+TRADE_FIELD_TYPES: Mapping[str, tuple[Callable[[object], bool], str]] = {
+    "date": (_is_string, "string"),
+    "time": (_is_string, "string"),
+    "source": (_is_string, "string"),
+    "holdings": (_is_string, "string"),
+    "commodity": (_is_string, "string"),
+    "units": (_is_string, "string"),
+    "price": (_is_string, "string"),
+    "total": (_is_string, "string"),
+    "fee": (_is_string, "string"),
+    "fees_account": (_is_string, "string"),
+    "currency": (_is_string, "string"),
+    "narration": (_is_string, "string"),
+    "payee": (_is_string, "string"),
+    "tags": (_is_string_array, "array of strings"),
+    "meta": (_is_string_object, "object with string values"),
+    "key": (_is_string, "string"),
+    "dry_run": (_is_boolean, "boolean"),
+}
+TRADE_FIELDS = tuple(TRADE_FIELD_TYPES)
+# 'total' and 'fee' are alternatives; parse_trade_request checks that pair itself.
+TRADE_REQUIRED = ("source", "holdings", "commodity", "units", "price", "key")
+UNITS_RE = re.compile(r"[1-9][0-9]{0,11}")
+PRICE_RE = re.compile(r"[0-9]{1,9}(\.[0-9]{1,4})?")
+CENT = Decimal("0.01")
+# Past this the amounts leave AMOUNT_RE's 15 integer digits.
+AMOUNT_LIMIT = Decimal(10) ** 15
 # 'targets' replaces 'target' and 'amount'; parse_add_request checks that pair itself.
 REQUIRED = ("source", "key")
 MAX_TARGETS = 20
@@ -166,23 +231,9 @@ MAX_DAYS_AHEAD = 366
 def parse_add_request(
     raw: object, accounts: Accounts, tz: datetime.tzinfo, today: datetime.date
 ) -> AddRequest | Rejection:
-    if not isinstance(raw, dict):
-        return Rejection(
-            "",
-            "invalid_body",
-            "Send a JSON object as the body, with Content-Type: application/json.",
-        )
-    for field in raw:
-        if field not in FIELDS:
-            return Rejection(
-                field,
-                "unknown_field",
-                f"Remove {field!r}; accepted fields are {', '.join(FIELDS)}.",
-            )
-    for field, value in raw.items():
-        is_type, json_type = FIELD_TYPES[field]
-        if not is_type(value):
-            return Rejection(field, "invalid_type", f"Send {field!r} as a JSON {json_type}.")
+    if (rejection := _check_fields(raw, FIELD_TYPES)) is not None:
+        return rejection
+    assert isinstance(raw, dict)
     if "targets" in raw:
         for field in ("target", "amount"):
             if field in raw:
@@ -203,44 +254,14 @@ def parse_add_request(
     else:
         pairs = [("target", raw["target"], "amount", raw["amount"])]
 
-    key = raw["key"]
-    if KEY_RE.fullmatch(key) is None:
-        return Rejection(
-            "key", "invalid_key", "Use only ASCII letters, digits, and - _ / . in 'key'."
-        )
+    key = _parse_key(raw)
+    if isinstance(key, Rejection):
+        return key
 
-    if ("date" in raw) == ("time" in raw):
-        return Rejection(
-            "date",
-            "date_or_time",
-            "Send exactly one of 'date' (YYYY-MM-DD) or 'time' (RFC 3339 with an offset).",
-        )
-    local_time = None
-    if "date" in raw:
-        try:
-            if DATE_RE.fullmatch(raw["date"]) is None:
-                raise ValueError
-            date = datetime.date.fromisoformat(raw["date"])
-        except ValueError:
-            return Rejection("date", "invalid_date", "Send 'date' as YYYY-MM-DD.")
-    else:
-        try:
-            if TIME_RE.fullmatch(raw["time"]) is None:
-                raise ValueError
-            moment = datetime.datetime.fromisoformat(raw["time"]).astimezone(tz)
-        # astimezone overflows at the ends of the date range, such as 9999-12-31T23:00:00Z.
-        except (ValueError, OverflowError):
-            return Rejection(
-                "time",
-                "invalid_time",
-                "Send 'time' as RFC 3339 with an offset, such as 2026-09-25T07:00:00+08:00.",
-            )
-        date = moment.date()
-        local_time = moment.strftime("%H:%M:%S")
-    latest = today + datetime.timedelta(days=MAX_DAYS_AHEAD)
-    if date > latest:
-        field = "date" if "date" in raw else "time"
-        return Rejection(field, "date_out_of_range", f"The date {date} is after {latest}.")
+    when = _parse_when(raw, tz, today)
+    if isinstance(when, Rejection):
+        return when
+    date, local_time = when
 
     for _, _, amount_field, amount_text in pairs:
         if AMOUNT_RE.fullmatch(amount_text) is None or Decimal(amount_text) <= 0:
@@ -251,59 +272,13 @@ def parse_add_request(
                 'such as "190".',
             )
 
-    currency = raw.get("currency", accounts.default_currency)
-    if currency is None:
-        return Rejection(
-            "currency", "missing", "The ledger has no operating currency; send 'currency'."
-        )
-    if CURRENCY_RE.fullmatch(currency) is None:
-        return Rejection(
-            "currency", "invalid_currency", f"{currency!r} is not a currency, such as TWD."
-        )
+    currency = _parse_currency(raw, accounts)
+    if isinstance(currency, Rejection):
+        return currency
 
-    narration = raw.get("narration", "")
-    if not _is_one_line(narration):
-        return Rejection(
-            "narration",
-            "invalid_narration",
-            "Remove line breaks and control characters from 'narration'.",
-        )
-
-    payee = raw.get("payee", "")
-    if not _is_one_line(payee):
-        return Rejection(
-            "payee", "invalid_payee", "Remove line breaks and control characters from 'payee'."
-        )
-
-    tags = frozenset(raw.get("tags", []))
-    for tag in sorted(tags):
-        if KEY_RE.fullmatch(tag) is None:
-            return Rejection(
-                "tags",
-                "invalid_tag",
-                f"Tag {tag!r} may use only ASCII letters, digits, and - _ / .; "
-                "put other text in 'meta'.",
-            )
-
-    meta = tuple(sorted(raw.get("meta", {}).items()))
-    for meta_key, meta_value in meta:
-        if META_KEY_RE.fullmatch(meta_key) is None:
-            return Rejection(
-                "meta",
-                "invalid_meta_key",
-                f"Meta key {meta_key!r} must start with a lowercase ASCII letter, "
-                "followed by ASCII letters, digits, - or _.",
-            )
-        if meta_key in RESERVED_META_KEYS:
-            return Rejection(
-                "meta", "reserved_meta_key", f"Remove {meta_key!r} from 'meta'; the API sets it."
-            )
-        if not _is_one_line(meta_value):
-            return Rejection(
-                "meta",
-                "invalid_meta_value",
-                f"Remove line breaks and control characters from meta {meta_key!r}.",
-            )
+    note = _parse_note(raw)
+    if isinstance(note, Rejection):
+        return note
 
     source = _resolve("source", raw["source"], date, accounts)
     if isinstance(source, Rejection):
@@ -349,13 +324,315 @@ def parse_add_request(
         source=source.name,
         targets=tuple(Target(account.name, amount) for account, amount in targets),
         currency=currency,
-        narration=narration,
-        payee=payee or None,
-        tags=tags,
-        meta=meta,
+        narration=note.narration,
+        payee=note.payee,
+        tags=note.tags,
+        meta=note.meta,
         key=key,
         dry_run=raw.get("dry_run", False),
     )
+
+
+def parse_trade_request(
+    raw: object, accounts: Accounts, tz: datetime.tzinfo, today: datetime.date
+) -> TradeRequest | Rejection:
+    if (rejection := _check_fields(raw, TRADE_FIELD_TYPES)) is not None:
+        return rejection
+    assert isinstance(raw, dict)
+    for field in TRADE_REQUIRED:
+        if field not in raw:
+            return Rejection(field, "missing", f"Send {field!r}.")
+    if ("total" in raw) == ("fee" in raw):
+        return Rejection("total", "total_or_fee", "Send exactly one of 'total' or 'fee'.")
+
+    key = _parse_key(raw)
+    if isinstance(key, Rejection):
+        return key
+
+    when = _parse_when(raw, tz, today)
+    if isinstance(when, Rejection):
+        return when
+    date, local_time = when
+
+    if CURRENCY_RE.fullmatch(raw["commodity"]) is None:
+        return Rejection(
+            "commodity",
+            "invalid_commodity",
+            f"{raw['commodity']!r} is not a commodity code, such as TWETF1.",
+        )
+    if UNITS_RE.fullmatch(raw["units"]) is None:
+        return Rejection(
+            "units",
+            "invalid_units",
+            "Send 'units' as a positive integer string of at most 12 digits, such as \"5000\".",
+        )
+    if PRICE_RE.fullmatch(raw["price"]) is None or Decimal(raw["price"]) <= 0:
+        return Rejection(
+            "price",
+            "invalid_price",
+            "Send 'price' as a positive decimal string with at most 9 integer digits and "
+            'at most 4 decimals, such as "29.5".',
+        )
+    units, price = Decimal(raw["units"]), Decimal(raw["price"])
+    cost = units * price
+    # Rounding the cost would leave the postings off balance by the rounded part.
+    if cost != cost.quantize(CENT) or cost >= AMOUNT_LIMIT:
+        return Rejection(
+            "price",
+            "inexact_cost",
+            "'units' times 'price' must be an amount of at most 15 integer digits and at "
+            "most 2 decimals; round the price or check the units.",
+        )
+    for field in ("total", "fee"):
+        if field in raw and AMOUNT_RE.fullmatch(raw[field]) is None:
+            return Rejection(
+                field,
+                "invalid_amount",
+                f"Send {field!r} as a non-negative decimal string with at most 2 decimals, "
+                'such as "210".',
+            )
+    if "total" in raw:
+        total = Decimal(raw["total"])
+        if total < cost:
+            return Rejection(
+                "total", "total_below_cost", f"'total' is less than units times price, {cost}."
+            )
+        fee = _plain(total - cost)
+    else:
+        fee = Decimal(raw["fee"])
+    if cost + fee >= AMOUNT_LIMIT:
+        return Rejection("fee", "invalid_amount", "The total must have at most 15 integer digits.")
+    if fee > 0 and "fees_account" not in raw:
+        return Rejection("fees_account", "missing", "Send 'fees_account' for a trade with a fee.")
+
+    currency = _parse_currency(raw, accounts)
+    if isinstance(currency, Rejection):
+        return currency
+    if raw["commodity"] == currency:
+        return Rejection(
+            "commodity",
+            "invalid_commodity",
+            f"'commodity' must differ from the currency {currency}.",
+        )
+
+    note = _parse_note(raw)
+    if isinstance(note, Rejection):
+        return note
+
+    source = _resolve("source", raw["source"], date, accounts)
+    if isinstance(source, Rejection):
+        return source
+    holdings = _resolve("holdings", raw["holdings"], date, accounts)
+    if isinstance(holdings, Rejection):
+        return holdings
+    if holdings.name.split(":", 1)[0] == accounts.expenses_root:
+        return Rejection(
+            "holdings",
+            "expense_account",
+            f"{holdings.name} is under {accounts.expenses_root}; 'holdings' must hold the shares.",
+        )
+    fees: Account | None = None
+    if "fees_account" in raw:
+        fees = _resolve("fees_account", raw["fees_account"], date, accounts)
+        if isinstance(fees, Rejection):
+            return fees
+        if fees.name.split(":", 1)[0] != accounts.expenses_root:
+            return Rejection(
+                "fees_account",
+                "not_expense_account",
+                f"{fees.name} is not under {accounts.expenses_root}; 'fees_account' must be "
+                "an expense account.",
+            )
+    named = [("source", source), ("holdings", holdings)]
+    if fees is not None:
+        named.append(("fees_account", fees))
+    for index, (field, account) in enumerate(named):
+        if any(account.name == other.name for _, other in named[:index]):
+            return Rejection(
+                field,
+                "same_account",
+                f"{field!r} resolves to {account.name}, which another account already uses; "
+                "'source', 'holdings', and 'fees_account' must differ.",
+            )
+    if holdings.declared and raw["commodity"] not in holdings.declared:
+        return Rejection(
+            "commodity",
+            "currency_not_allowed",
+            f"{holdings.name} accepts only {', '.join(sorted(holdings.declared))}.",
+        )
+    for account in (source, *([fees] if fees is not None and fee > 0 else [])):
+        if currency not in account.currencies:
+            return Rejection(
+                "currency",
+                "currency_not_allowed",
+                f"{account.name} accepts only {', '.join(sorted(account.currencies))}.",
+            )
+
+    return TradeRequest(
+        date=date,
+        time=local_time,
+        source=source.name,
+        holdings=holdings.name,
+        fees_account=fees.name if fees is not None else None,
+        commodity=raw["commodity"],
+        units=units,
+        price=price,
+        fee=fee,
+        currency=currency,
+        narration=note.narration,
+        payee=note.payee,
+        tags=note.tags,
+        meta=note.meta,
+        key=key,
+        dry_run=raw.get("dry_run", False),
+    )
+
+
+def _plain(number: Decimal) -> Decimal:
+    """The number without the trailing zeros that arithmetic leaves, so 210.0 prints as 210."""
+    if number == number.to_integral_value():
+        return Decimal(int(number))
+    return number.normalize()
+
+
+@dataclass(frozen=True)
+class Note:
+    narration: str
+    payee: str | None
+    tags: frozenset[str]
+    meta: tuple[tuple[str, str], ...]
+
+
+def _check_fields(
+    raw: object, types: Mapping[str, tuple[Callable[[object], bool], str]]
+) -> Rejection | None:
+    """The body is an object whose fields are all known and of the right JSON type."""
+    if not isinstance(raw, dict):
+        return Rejection(
+            "",
+            "invalid_body",
+            "Send a JSON object as the body, with Content-Type: application/json.",
+        )
+    for field in raw:
+        if field not in types:
+            return Rejection(
+                field,
+                "unknown_field",
+                f"Remove {field!r}; accepted fields are {', '.join(types)}.",
+            )
+    for field, value in raw.items():
+        is_type, json_type = types[field]
+        if not is_type(value):
+            return Rejection(field, "invalid_type", f"Send {field!r} as a JSON {json_type}.")
+    return None
+
+
+def _parse_key(raw: Mapping[str, Any]) -> str | Rejection:
+    key = raw["key"]
+    if KEY_RE.fullmatch(key) is None:
+        return Rejection(
+            "key", "invalid_key", "Use only ASCII letters, digits, and - _ / . in 'key'."
+        )
+    return key
+
+
+def _parse_when(
+    raw: Mapping[str, Any], tz: datetime.tzinfo, today: datetime.date
+) -> tuple[datetime.date, str | None] | Rejection:
+    """The local date, and the local time when the request sent 'time'."""
+    if ("date" in raw) == ("time" in raw):
+        return Rejection(
+            "date",
+            "date_or_time",
+            "Send exactly one of 'date' (YYYY-MM-DD) or 'time' (RFC 3339 with an offset).",
+        )
+    local_time = None
+    if "date" in raw:
+        try:
+            if DATE_RE.fullmatch(raw["date"]) is None:
+                raise ValueError
+            date = datetime.date.fromisoformat(raw["date"])
+        except ValueError:
+            return Rejection("date", "invalid_date", "Send 'date' as YYYY-MM-DD.")
+    else:
+        try:
+            if TIME_RE.fullmatch(raw["time"]) is None:
+                raise ValueError
+            moment = datetime.datetime.fromisoformat(raw["time"]).astimezone(tz)
+        # astimezone overflows at the ends of the date range, such as 9999-12-31T23:00:00Z.
+        except (ValueError, OverflowError):
+            return Rejection(
+                "time",
+                "invalid_time",
+                "Send 'time' as RFC 3339 with an offset, such as 2026-09-25T07:00:00+08:00.",
+            )
+        date = moment.date()
+        local_time = moment.strftime("%H:%M:%S")
+    latest = today + datetime.timedelta(days=MAX_DAYS_AHEAD)
+    if date > latest:
+        field = "date" if "date" in raw else "time"
+        return Rejection(field, "date_out_of_range", f"The date {date} is after {latest}.")
+    return date, local_time
+
+
+def _parse_currency(raw: Mapping[str, Any], accounts: Accounts) -> str | Rejection:
+    currency = raw.get("currency", accounts.default_currency)
+    if currency is None:
+        return Rejection(
+            "currency", "missing", "The ledger has no operating currency; send 'currency'."
+        )
+    if CURRENCY_RE.fullmatch(currency) is None:
+        return Rejection(
+            "currency", "invalid_currency", f"{currency!r} is not a currency, such as TWD."
+        )
+    return currency
+
+
+def _parse_note(raw: Mapping[str, Any]) -> Note | Rejection:
+    narration = raw.get("narration", "")
+    if not _is_one_line(narration):
+        return Rejection(
+            "narration",
+            "invalid_narration",
+            "Remove line breaks and control characters from 'narration'.",
+        )
+
+    payee = raw.get("payee", "")
+    if not _is_one_line(payee):
+        return Rejection(
+            "payee", "invalid_payee", "Remove line breaks and control characters from 'payee'."
+        )
+
+    tags = frozenset(raw.get("tags", []))
+    for tag in sorted(tags):
+        if KEY_RE.fullmatch(tag) is None:
+            return Rejection(
+                "tags",
+                "invalid_tag",
+                f"Tag {tag!r} may use only ASCII letters, digits, and - _ / .; "
+                "put other text in 'meta'.",
+            )
+
+    meta = tuple(sorted(raw.get("meta", {}).items()))
+    for meta_key, meta_value in meta:
+        if META_KEY_RE.fullmatch(meta_key) is None:
+            return Rejection(
+                "meta",
+                "invalid_meta_key",
+                f"Meta key {meta_key!r} must start with a lowercase ASCII letter, "
+                "followed by ASCII letters, digits, - or _.",
+            )
+        if meta_key in RESERVED_META_KEYS:
+            return Rejection(
+                "meta", "reserved_meta_key", f"Remove {meta_key!r} from 'meta'; the API sets it."
+            )
+        if not _is_one_line(meta_value):
+            return Rejection(
+                "meta",
+                "invalid_meta_value",
+                f"Remove line breaks and control characters from meta {meta_key!r}.",
+            )
+    return Note(narration, payee or None, tags, meta)
 
 
 def _target_pairs(raw: list[object]) -> list[tuple[str, str, str, str]] | Rejection:
@@ -425,14 +702,18 @@ def _resolve(field: str, text: str, date: datetime.date, accounts: Accounts) -> 
     return account
 
 
+def _entry_meta(meta: tuple[tuple[str, str], ...], time: str | None) -> dict[str, str]:
+    merged = dict(meta)
+    if time is not None:
+        merged["time"] = time
+    # fava prints metadata in insertion order and the key check compares printed entries,
+    # so the keys go in one fixed order.
+    return dict(sorted(merged.items()))
+
+
 def build_transaction(req: AddRequest) -> Transaction:
-    meta = dict(req.meta)
-    if req.time is not None:
-        meta["time"] = req.time
     return create.transaction(
-        # fava prints metadata in insertion order and the key check compares printed entries,
-        # so the keys go in one fixed order.
-        meta=dict(sorted(meta.items())),
+        meta=_entry_meta(req.meta, req.time),
         date=req.date,
         flag="!",
         payee=req.payee,
@@ -449,6 +730,32 @@ def build_transaction(req: AddRequest) -> Transaction:
                 req.source, create.amount(-sum(t.amount for t in req.targets), req.currency)
             ),
         ],
+    )
+
+
+def build_trade(req: TradeRequest) -> Transaction:
+    # The cost carries the trade date, as booking would set it, so a loaded entry prints
+    # the same text and a retry finds the entry it wrote.
+    cost = CostSpec(req.price, None, req.currency, req.date, None, False)
+    postings = [
+        create.posting(
+            req.holdings,
+            create.amount(req.units, req.commodity),
+            cost=cost,  # type: ignore[arg-type]
+        )
+    ]
+    if req.fees_account is not None and req.fee > 0:
+        postings.append(create.posting(req.fees_account, create.amount(req.fee, req.currency)))
+    postings.append(create.posting(req.source, create.amount(-req.total, req.currency)))
+    return create.transaction(
+        meta=_entry_meta(req.meta, req.time),
+        date=req.date,
+        flag="!",
+        payee=req.payee,
+        narration=req.narration,
+        tags=req.tags,
+        links=frozenset({req.link}),
+        postings=postings,
     )
 
 

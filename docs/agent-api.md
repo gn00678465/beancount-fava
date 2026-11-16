@@ -16,7 +16,7 @@ flowchart LR
     Agent["Agent<br>Claude Code"] -->|"區網 http://192.168.2.11:5656<br>Authorization: Bearer"| Guard
     subgraph Container["fava container（port 5000）"]
         Guard["guard<br>檢查憑證與路徑"] --> Fava["fava 網頁與 /api/"]
-        Guard --> Ext["AgentApi extension<br>transactions、spending、approve、mcp"]
+        Guard --> Ext["AgentApi extension<br>transactions、trades、spending、approve、mcp"]
         Ext --> Fava
     end
     Fava --> Ledger[("ledger 檔<br>/ledger")]
@@ -53,6 +53,8 @@ sequenceDiagram
 ```
 
 同一個 `key` 只會寫入一次。Agent 在逾時或連線中斷後，以同一個 `key` 重送，不會寫入第二筆。
+
+買進股票走另一個端點 `trades`：股數與成本放在持倉帳戶，手續費放在費用帳戶，付款帳戶出總額。流程、`key` 與核准都和一般交易相同，欄位見 [API 參考](agent-api-reference.md)。
 
 ## 部署到 Unraid
 
