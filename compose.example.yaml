@@ -7,7 +7,7 @@
 # Access JWT, and the port stays on loopback because the token travels in cleartext.
 services:
   fava:
-    image: gn00678465/beancount-fava:1.30.16-beancount3.2.3@sha256:fade3fcf4fde54b260b745e68b5341f99fe8b50d75ec25eeefc013473d711121
+    image: gn00678465/beancount-fava:1.30.16-beancount3.2.3@sha256:1af9ea5570ab3b5f497203c78e96c643a873de34f4a1e183c07c8760fbeedcdf
     # The image runs as uid 1000. That uid must write the ledger files, or fava cannot save
     # edits, and read agent-token. On Unraid, where appdata belongs to 99:100 (nobody:users),
     # uncomment the next line and give uid 99 that access.
